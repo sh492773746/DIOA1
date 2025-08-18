@@ -1,0 +1,22 @@
+# Node
+node_modules/
+*.log
+.npmrc
+
+# Build outputs
+dist/
+build/
+.cache/
+.vite/
+.eslintcache
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
