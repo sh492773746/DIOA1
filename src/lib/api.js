@@ -1,0 +1,61 @@
+import { supabase as supabaseClient } from '@/lib/customSupabaseClient';
+import { toast } from '@/components/ui/use-toast';
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+export const fetchWithRetry = async (query, retries = 3, delay = 1000) => {
+    if (!supabaseClient) {
+        console.error("Supabase client is not available for fetchWithRetry.");
+        return { data: null, error: new Error('Supabase client not initialized'), status: 500, count: null };
+    }
+
+    for (let i = 0; i < retries; i++) {
+        try {
+            const { data, error, status, count } = await query();
+            
+            if (error) {
+                // Network errors are often thrown, not returned in the `error` object.
+                // We handle them in the catch block.
+                if (error.message.includes('session_not_found') || error.code === 'PGRST116' || error.message.includes('aborted')) {
+                    return { data, error, status, count };
+                }
+                throw error;
+            }
+            return { data, error, status, count };
+        } catch (e) {
+             // Handle TypeError: Failed to fetch specifically
+            if (e instanceof TypeError && e.message === 'Failed to fetch') {
+                console.error(`NetworkError: Failed to fetch. Attempt ${i + 1} of ${retries}.`);
+                if (i === retries - 1) {
+                     toast({
+                        variant: "destructive",
+                        title: "网络连接失败",
+                        description: "无法连接到服务器。请检查您的网络连接并重试。"
+                    });
+                    // Stop retrying on persistent network failure
+                    return { data: null, error: e, status: 0, count: null };
+                }
+                await sleep(delay);
+                continue; // go to next retry
+            }
+
+            if (e.message.includes('aborted')) {
+                 console.warn('Fetch was aborted, likely due to a component unmounting or a new request being made. This is often normal in React applications.');
+                 return { data: null, error: e, status: 0, count: null };
+            }
+
+            if (i === retries - 1) {
+                console.error(`Fetch failed after ${retries} retries:`, e);
+                toast({
+                    variant: "destructive",
+                    title: "请求错误",
+                    description: "多次尝试后无法获取数据。请稍后重试。"
+                });
+                 return { data: null, error: e, status: 500, count: null };
+            }
+            console.warn(`Fetch attempt ${i + 1} failed, retrying in ${delay}ms...`, e.message);
+            await sleep(delay);
+        }
+    }
+    return { data: null, error: new Error('Exhausted retries'), status: 500, count: null };
+};
