@@ -56,7 +56,7 @@ const SocialFeed = () => {
         const from = pageParam * POSTS_PER_PAGE;
         const to = from + POSTS_PER_PAGE - 1;
         
-        // RLS now handles tenant filtering, so we don't need .eq('tenant_id', activeTenantId) here.
+        // 🔧 修复：添加显式的租户过滤，确保数据隔离
         let query = supabase
             .from('posts')
             .select(`
@@ -65,6 +65,7 @@ const SocialFeed = () => {
                 likes(user_id),
                 comments(count)
             `)
+            .eq('tenant_id', activeTenantId) // ✅ 添加租户过滤
             .eq('is_ad', activeTab === 'ads')
             .eq('status', 'approved') // Only show approved posts on the feed
             .order('is_pinned', { ascending: false })

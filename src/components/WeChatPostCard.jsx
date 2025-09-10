@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '@/contexts/SupabaseAuthContext';
+import { useTenant } from '@/contexts/TenantContext';
 import { supabase as supabaseClient } from '@/lib/customSupabaseClient';
 import { useToast } from '@/components/ui/use-toast';
 import PostComments from '@/components/PostComments';
@@ -24,6 +25,7 @@ import PostFooter from '@/components/wechat-post-card/PostFooter';
 
 const WeChatPostCard = ({ post, onPostUpdated, onDeletePost }) => {
   const { user, isAdmin } = useAuth();
+  const { activeTenantId } = useTenant();
   const { toast } = useToast();
   
   const [hasLiked, setHasLiked] = React.useState(post.likes?.some(like => like.user_id === user?.id));
@@ -42,10 +44,11 @@ const WeChatPostCard = ({ post, onPostUpdated, onDeletePost }) => {
       .from('comments')
       .select('*, author:profiles(id, username, avatar_url)')
       .eq('post_id', post.id)
+      .eq('tenant_id', activeTenantId)
       .eq('status', 'approved')
       .order('created_at', { ascending: false })
       .then(({ data }) => setComments(data || []));
-  }, [post.id]);
+  }, [post.id, activeTenantId]);
 
   React.useEffect(() => {
     setHasLiked(post.likes?.some(like => like.user_id === user?.id));

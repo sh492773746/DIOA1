@@ -4,8 +4,9 @@ import { supabase as supabaseClient } from '@/lib/customSupabaseClient';
 import WeChatPostCard from '@/components/WeChatPostCard';
 import { Skeleton } from '@/components/ui/skeleton';
 import { motion } from 'framer-motion';
+import { useTenant } from '@/contexts/TenantContext'; // ✅ 添加租户上下文
 
-const fetchUserPosts = async (userId) => {
+const fetchUserPosts = async (userId, activeTenantId) => {
   if (!userId) return [];
 
   const { data, error } = await supabaseClient
@@ -27,6 +28,7 @@ const fetchUserPosts = async (userId) => {
       likes(user_id)
     `)
     .eq('user_id', userId)
+    .eq('tenant_id', activeTenantId) // ✅ 添加租户过滤
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -60,10 +62,12 @@ const PostSkeleton = () => (
 );
 
 const UserPostHistory = ({ userId }) => {
+  const { activeTenantId } = useTenant(); // ✅ 获取当前租户ID
+  
   const { data: posts, isLoading, isError, error } = useQuery({
-    queryKey: ['userPosts', userId],
-    queryFn: () => fetchUserPosts(userId),
-    enabled: !!userId,
+    queryKey: ['userPosts', userId, activeTenantId], // ✅ 添加租户ID到查询键
+    queryFn: () => fetchUserPosts(userId, activeTenantId), // ✅ 传递租户ID
+    enabled: !!userId && activeTenantId !== undefined,
   });
 
   if (isLoading) {

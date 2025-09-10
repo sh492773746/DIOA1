@@ -85,9 +85,18 @@ const ContentModeration = () => {
     const fetchData = useCallback(async () => {
         setLoading(true);
         
-        // Let RLS handle the tenant filtering based on the domain.
-        let postsQuery = supabaseClient.from('posts').select('*, author:profiles(id, username, avatar_url)').order('created_at', { ascending: false });
-        let commentsQuery = supabaseClient.from('comments').select('*, author:profiles(id, username, avatar_url), post:posts(content)').order('created_at', { ascending: false });
+        // 🔧 修复：添加显式的租户过滤，确保数据隔离
+        let postsQuery = supabaseClient
+            .from('posts')
+            .select('*, author:profiles(id, username, avatar_url)')
+            .eq('tenant_id', activeTenantId) // ✅ 添加租户过滤
+            .order('created_at', { ascending: false });
+            
+        let commentsQuery = supabaseClient
+            .from('comments')
+            .select('*, author:profiles(id, username, avatar_url), post:posts(content)')
+            .eq('tenant_id', activeTenantId) // ✅ 添加租户过滤
+            .order('created_at', { ascending: false });
         
         const [postsRes, commentsRes] = await Promise.all([postsQuery, commentsQuery]);
 
@@ -116,7 +125,7 @@ const ContentModeration = () => {
 
         setContentByUser(groupedContent);
         setLoading(false);
-    }, [toast]);
+    }, [toast, activeTenantId]);
 
     useEffect(() => {
         if (isInitialized) {
