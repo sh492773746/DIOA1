@@ -4,49 +4,19 @@ import { useToast } from '@/components/ui/use-toast';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTenant } from '@/contexts/TenantContext';
 import { fetchWithRetry } from '@/lib/api';
+import { fetchEffectiveSettings } from '@/lib/repos/settingsRepo';
 
 const AuthContext = createContext(undefined);
 
 const fetchSiteSettings = async (currentTenantId) => {
   if (!supabaseClient || currentTenantId === undefined || currentTenantId === null) return {};
-
-  const { data: tenantData, error: tenantError } = await fetchWithRetry(() =>
-    supabaseClient
-      .from('app_settings')
-      .select('key, value')
-      .eq('tenant_id', currentTenantId)
-  );
-
-  if (tenantError) {
-    console.error(`Error fetching settings for tenant ${currentTenantId}:`, tenantError);
+  try {
+    const settings = await fetchEffectiveSettings({ supabase: supabaseClient, tenantId: currentTenantId });
+    return settings;
+  } catch (e) {
+    console.error('Error fetching effective settings:', e);
+    return {};
   }
-
-  let settings = (tenantData || []).reduce((acc, { key, value }) => {
-    acc[key] = value;
-    return acc;
-  }, {});
-
-  if (currentTenantId !== 0) {
-    const { data: mainData, error: mainError } = await fetchWithRetry(() =>
-        supabaseClient
-            .from('app_settings')
-            .select('key, value')
-            .eq('tenant_id', 0)
-    );
-    if (mainError) {
-      console.error('Error fetching main site settings as fallback:', mainError);
-    } else {
-      const mainSettings = (mainData || []).reduce((acc, { key, value }) => {
-        if (!acc.hasOwnProperty(key)) { // Only use main setting if tenant doesn't have it
-          acc[key] = value;
-        }
-        return acc;
-      }, settings);
-      settings = mainSettings;
-    }
-  }
-
-  return settings;
 };
 
 const fetchProfile = async (userId) => {
