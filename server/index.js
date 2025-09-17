@@ -19,7 +19,8 @@ function getPrimary() {
 app.get('/health', (c) => c.json({ ok: true }));
 app.get('/api/health', (c) => c.json({ ok: true }));
 
-app.get('/api/settings', async (c) => {
+// Settings (with and without /api prefix)
+app.get('/settings', async (c) => {
 	try {
 		const scope = c.req.query('scope') || 'merged';
 		const client = getPrimary();
@@ -36,12 +37,14 @@ app.get('/api/settings', async (c) => {
 		if (!map['social_forum_mode']) map['social_forum_mode'] = 'shared';
 		return c.json(map);
 	} catch (e) {
-		console.error('GET /api/settings error', e);
+		console.error('GET /settings error', e);
 		return c.json({});
 	}
 });
+app.get('/api/settings', async (c) => c.redirect('/settings'));
 
-app.get('/api/page-content', async (c) => {
+// Page content
+app.get('/page-content', async (c) => {
 	try {
 		const page = c.req.query('page');
 		const section = c.req.query('section');
@@ -60,12 +63,14 @@ app.get('/api/page-content', async (c) => {
 		});
 		return c.json(list);
 	} catch (e) {
-		console.error('GET /api/page-content error', e);
+		console.error('GET /page-content error', e);
 		return c.json([]);
 	}
 });
+app.get('/api/page-content', async (c) => c.redirect('/page-content'));
 
-app.get('/api/tenant/resolve', async (c) => {
+// Tenant resolve
+app.get('/tenant/resolve', async (c) => {
 	try {
 		const hostname = c.req.query('host') || '';
 		const client = getPrimary();
@@ -79,6 +84,7 @@ app.get('/api/tenant/resolve', async (c) => {
 		return c.json({ tenantId: 0 });
 	}
 });
+app.get('/api/tenant/resolve', async (c) => c.redirect('/tenant/resolve'));
 
 const port = process.env.PORT ? Number(process.env.PORT) : 8787;
 if (!process.env.VERCEL) {
