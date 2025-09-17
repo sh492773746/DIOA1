@@ -29,8 +29,6 @@ app.get('/api/settings', async (c) => {
 			if (!map['social_forum_mode']) map['social_forum_mode'] = 'shared';
 			return c.json(map);
 		}
-		// merged: tenant + main fallback. TenantId resolved由前端 hostname，但此处简化为 0（主站）
-		// 若你需要域名租户解析，可在此按 host 做映射；目前先返回主站设置，避免前端空白。
 		const { rows } = await client.execute("select key, value, tenant_id from app_settings where tenant_id in (0)");
 		const map = {};
 		for (const r of rows || []) map[r.key || r.KEY] = r.value || r.VALUE;
@@ -63,6 +61,21 @@ app.get('/api/page-content', async (c) => {
 	} catch (e) {
 		console.error('GET /api/page-content error', e);
 		return c.json([]);
+	}
+});
+
+app.get('/api/tenant/resolve', async (c) => {
+	try {
+		const hostname = c.req.query('host') || '';
+		const client = getPrimary();
+		const { rows } = await client.execute({
+			sql: "select id from tenant_requests where desired_domain = ? limit 1",
+			args: [hostname]
+		});
+		const id = rows && rows[0] ? (rows[0].id || rows[0].ID) : 0;
+		return c.json({ tenantId: id || 0 });
+	} catch (e) {
+		return c.json({ tenantId: 0 });
 	}
 });
 

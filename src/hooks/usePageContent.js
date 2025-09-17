@@ -13,9 +13,9 @@ export const usePageContent = (page, section) => {
   };
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['pageContent', page, section, activeTenantId],
+    queryKey: ['pageContent', page, section],
     queryFn: fetchPageContent,
-    enabled: isInitialized && !isTenantLoading && activeTenantId !== undefined && activeTenantId !== null && !!supabase,
+    enabled: isInitialized && !isTenantLoading,
     staleTime: 1000 * 60 * 5, 
   });
 

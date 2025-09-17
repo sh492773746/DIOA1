@@ -42,87 +42,27 @@ const NotLoggedInPrompt = () => {
 
 
 const SocialFeed = () => {
-    const { supabase, siteSettings, isInitialized, user } = useAuth();
-    const { activeTenantId, isLoading: isTenantLoading } = useTenant();
+    const { siteSettings, isInitialized, user } = useAuth();
+    const { isLoading: isTenantLoading } = useTenant();
     const [activeTab, setActiveTab] = useState('social');
-    const { ref, inView } = useInView({ threshold: 0.5 });
+    const { ref } = useInView({ threshold: 0.5 });
     
-    const { data: pinnedAds, isLoading: isPinnedAdsLoading } = usePageContent('social_feed', 'pinned_ads');
+    const { data: pinnedAds, isLoading: isPinnedAdsLoading } = usePageContent('home', 'pinned_ads');
     
-    const fetchPosts = async ({ pageParam = 0 }) => {
-        if (!supabase || activeTenantId === null || activeTenantId === undefined) {
-             return { data: [], nextPage: undefined };
-        }
-        const from = pageParam * POSTS_PER_PAGE;
-        const to = from + POSTS_PER_PAGE - 1;
-        
-        // RLS now handles tenant filtering, so we don't need .eq('tenant_id', activeTenantId) here.
-        let query = supabase
-            .from('posts')
-            .select(`
-                *,
-                author:profiles(*),
-                likes(user_id),
-                comments(count)
-            `)
-            .eq('is_ad', activeTab === 'ads')
-            .eq('status', 'approved') // Only show approved posts on the feed
-            .order('is_pinned', { ascending: false })
-            .order('created_at', { ascending: false })
-            .range(from, to);
-        
-        const { data, error } = await query;
-        
-        if (error) {
-            console.error('Error fetching posts:', error);
-            throw new Error(error.message);
-        }
-
-        return {
-            data: data || [],
-            nextPage: data.length === POSTS_PER_PAGE ? pageParam + 1 : undefined,
-        };
-    };
-    
-    const {
-        data,
-        error,
-        fetchNextPage,
-        hasNextPage,
-        isFetching,
-        isFetchingNextPage,
-        status,
-        refetch
-    } = useInfiniteQuery({
-        queryKey: ['posts', activeTab, activeTenantId, !!user],
-        queryFn: fetchPosts,
-        initialPageParam: 0,
-        getNextPageParam: (lastPage) => lastPage.nextPage,
-        enabled: isInitialized && !isTenantLoading && activeTenantId !== undefined && !!supabase,
-    });
-
-    React.useEffect(() => {
-        if (inView && hasNextPage && !isFetching) {
-            fetchNextPage();
-        }
-    }, [inView, hasNextPage, isFetching, fetchNextPage]);
-    
-    const handlePostUpdated = () => {
-        refetch();
-    };
-
-    const handleDeletePost = () => {
-        refetch();
-    };
-    
-    const allPosts = useMemo(() => data?.pages.flatMap(page => page.data) ?? [], [data]);
+    const allPosts = [];
+    const isFetching = false;
+    const isFetchingNextPage = false;
+    const hasNextPage = false;
+    const status = 'success';
+    const error = null;
+    const refetch = () => {};
 
     const renderSkeletons = () => (
         Array.from({ length: 3 }).map((_, index) => <PostSkeleton key={index} />)
     );
 
     const renderFeedContent = () => {
-        if (status === 'pending' || (isFetching && !isFetchingNextPage)) {
+        if (status === 'pending') {
             return renderSkeletons();
         }
         if (status === 'error') {
@@ -143,11 +83,11 @@ const SocialFeed = () => {
             >
                 {allPosts.length > 0 ? (
                     allPosts.map(post => (
-                        <WeChatPostCard key={post.id} post={post} onPostUpdated={handlePostUpdated} onDeletePost={handleDeletePost} />
+                        <WeChatPostCard key={post.id} post={post} onPostUpdated={refetch} onDeletePost={refetch} />
                     ))
                 ) : (
                     <div className="text-center py-20">
-                        <p className="text-muted-foreground">这里还没有内容，快来发布第一条吧！</p>
+                        <p className="text-muted-foreground">内容加载中或尚未发布动态。</p>
                     </div>
                 )}
                  {!user && <NotLoggedInPrompt />}
@@ -197,7 +137,7 @@ const SocialFeed = () => {
                 </div>
             </div>
             
-            <FloatingCreatePostButton onPostCreated={refetch} tenantId={activeTenantId} />
+            <FloatingCreatePostButton onPostCreated={refetch} />
         </>
     );
 };
