@@ -17,6 +17,7 @@ function getPrimary() {
 }
 
 app.get('/health', (c) => c.json({ ok: true }));
+app.get('/api/health', (c) => c.json({ ok: true }));
 
 app.get('/api/settings', async (c) => {
 	try {
