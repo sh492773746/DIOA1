@@ -18,7 +18,7 @@ export const TenantProvider = ({ children }) => {
       const host = window.location.hostname;
       const idFromHost = await getTenantIdByHostname(host);
       
-      setActiveTenantId(idFromHost);
+      setActiveTenantId(prev => (prev === idFromHost ? prev : idFromHost));
       logTenantInfo(host, idFromHost);
       
       setIsLoading(false);
