@@ -8,19 +8,29 @@ import { fetchWithRetry } from '@/lib/api';
 
 const AuthContext = createContext(undefined);
 
-const fetchSiteSettings = async () => {
+const fetchSiteSettings = async (currentTenantId) => {
+  if (currentTenantId === undefined || currentTenantId === null) return {};
   try {
     const res = await fetch('/api/settings');
     if (!res.ok) return {};
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      return {};
-    }
-    return await res.json();
+    const map = await res.json();
+    return map || {};
   } catch (e) {
-    console.error('Error fetching settings via BFF:', e);
+    console.error('Error fetching settings via Turso:', e);
     throw e;
   }
+};
+
+const fetchMainSiteSettings = async () => {
+  try {
+    const res = await fetch('/api/settings?scope=main');
+    if (!res.ok) return {};
+    const map = await res.json();
+    return map || {};
+  } catch (e) {
+    console.error('Error fetching MAIN settings via Turso:', e);
+    return {};
+    }
 };
 
 const fetchProfile = async (userId) => {
@@ -68,7 +78,6 @@ export const AuthProvider = ({ children }) => {
   const [siteSettings, setSiteSettings] = useState({});
   const [areSettingsLoading, setAreSettingsLoading] = useState(true);
   const [connectionError, setConnectionError] = useState(null);
-  const [lastLoadedTenantId, setLastLoadedTenantId] = useState(undefined);
   
   const { data: profile, isLoading: isProfileLoading } = useQuery({
       queryKey: ['profile', user?.id],
@@ -99,16 +108,12 @@ export const AuthProvider = ({ children }) => {
   useEffect(() => {
     const loadSettings = async () => {
       if (tenantId !== undefined && tenantId !== null) {
-        if (lastLoadedTenantId === tenantId && Object.keys(siteSettings || {}).length > 0) {
-          return;
-        }
         setAreSettingsLoading(true);
         try {
           const settings = await fetchSiteSettings(tenantId);
           setSiteSettings(settings);
-          setLastLoadedTenantId(tenantId);
         } catch (e) {
-          if (e.message?.includes('Failed to fetch')) {
+          if (e.message.includes('Failed to fetch')) {
             setConnectionError("无法连接到数据库。请检查您的网络设置或完成Supabase集成。");
           }
         } finally {
@@ -119,7 +124,7 @@ export const AuthProvider = ({ children }) => {
     if (!isTenantLoading) {
       loadSettings();
     }
-  }, [tenantId, isTenantLoading, lastLoadedTenantId, siteSettings]);
+  }, [tenantId, isTenantLoading]);
 
   const signOut = useCallback(async () => {
     try {

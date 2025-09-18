@@ -2,8 +2,7 @@ import fetchHandler from '../server/index.js';
 
 export default async function handler(req, res) {
   try {
-    const protoHdr = req.headers['x-forwarded-proto'] || req.headers['x-forwarded-protocol'] || 'https';
-    const protocol = Array.isArray(protoHdr) ? protoHdr[0] : String(protoHdr).split(',')[0];
+    const protocol = (req.headers['x-forwarded-proto'] || 'https').split(',')[0];
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     const url = `${protocol}://${host}${req.url}`;
 

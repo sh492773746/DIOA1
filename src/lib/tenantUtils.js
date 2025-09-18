@@ -1,16 +1,15 @@
 import { supabase } from '@/lib/customSupabaseClient';
-import { useCallback } from 'react';
 
 export const useTenantUtils = () => {
 
-    const logTenantInfo = useCallback((hostname, tenantId) => {
+    const logTenantInfo = (hostname, tenantId) => {
         console.groupCollapsed(`%c[Tenant Context] Host: ${hostname}`, 'color: #8A2BE2; font-weight: bold;');
         console.log(`%cResolved Tenant ID: %c${tenantId}`, 'color: #4CAF50;', 'font-weight: bold;');
         console.log(`%cIs Main Site: %c${tenantId === 0}`, 'color: #FF5722;', 'font-weight: bold;');
         console.groupEnd();
-    }, []);
+    };
 
-    const fetchTenantDetails = useCallback(async (tenantId) => {
+    const fetchTenantDetails = async (tenantId) => {
         if (!tenantId || tenantId === 0) return { name: 'Main Site' };
         const { data, error } = await supabase
             .from('tenant_requests')
@@ -23,7 +22,7 @@ export const useTenantUtils = () => {
             return null;
         }
         return { name: data.desired_domain };
-    }, []);
+    };
 
     return { logTenantInfo, fetchTenantDetails };
 };

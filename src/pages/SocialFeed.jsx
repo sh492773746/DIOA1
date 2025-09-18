@@ -15,8 +15,9 @@ import { Button } from '@/components/ui/button';
 import { LogIn } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useWindowVirtualizer } from '@tanstack/react-virtual';
 
-const POSTS_PER_PAGE = 10;
+const POSTS_PER_PAGE = 20;
 
 const NotLoggedInPrompt = () => {
     const navigate = useNavigate();
@@ -45,24 +46,73 @@ const SocialFeed = () => {
     const { siteSettings, isInitialized, user } = useAuth();
     const { isLoading: isTenantLoading } = useTenant();
     const [activeTab, setActiveTab] = useState('social');
-    const { ref } = useInView({ threshold: 0.5 });
+    const { ref, inView } = useInView({ threshold: 0.5 });
     
-    const { data: pinnedAds, isLoading: isPinnedAdsLoading } = usePageContent('home', 'pinned_ads');
+    // 修正：与后台 pageContentConfig 一致，使用 'social' 页面
+    const { data: pinnedAds, isLoading: isPinnedAdsLoading } = usePageContent('social', 'pinned_ads');
     
-    const allPosts = [];
-    const isFetching = false;
-    const isFetchingNextPage = false;
-    const hasNextPage = false;
-    const status = 'success';
-    const error = null;
-    const refetch = () => {};
+    const fetchPosts = async ({ pageParam = 0 }) => {
+        const sharedMode = String(siteSettings?.social_forum_mode || '').toLowerCase() === 'shared';
+        const url = sharedMode
+          ? `/api/shared/posts?page=${pageParam}&size=${POSTS_PER_PAGE}`
+          : `/api/posts?tab=${activeTab}&page=${pageParam}&size=${POSTS_PER_PAGE}`;
+        const token = localStorage.getItem('sb-access-token');
+        const headers = token ? { Authorization: `Bearer ${token}` } : undefined;
+        const res = await fetch(url, { headers });
+        if (!res.ok) throw new Error('Failed to load posts');
+        const rows = await res.json();
+        return {
+            data: rows || [],
+            nextPage: (rows || []).length === POSTS_PER_PAGE ? pageParam + 1 : undefined,
+        };
+    };
+    
+    const {
+        data,
+        error,
+        fetchNextPage,
+        hasNextPage,
+        isFetching,
+        isFetchingNextPage,
+        status,
+        refetch
+    } = useInfiniteQuery({
+        queryKey: ['posts', activeTab, !!user, siteSettings?.social_forum_mode || ''],
+        queryFn: fetchPosts,
+        initialPageParam: 0,
+        getNextPageParam: (lastPage) => lastPage.nextPage,
+        enabled: isInitialized && !isTenantLoading,
+    });
+
+    React.useEffect(() => {
+        if (inView && hasNextPage && !isFetching) {
+            fetchNextPage();
+        }
+    }, [inView, hasNextPage, isFetching, fetchNextPage]);
+    
+    const handlePostUpdated = () => {
+        refetch();
+    };
+
+    const handleDeletePost = () => {
+        refetch();
+    };
+    
+    const allPosts = useMemo(() => data?.pages.flatMap(page => page.data) ?? [], [data]);
+
+    const rowVirtualizer = useWindowVirtualizer({
+        count: allPosts.length,
+        estimateSize: () => 360,
+        overscan: 8,
+    });
+    const virtualItems = rowVirtualizer.getVirtualItems();
 
     const renderSkeletons = () => (
         Array.from({ length: 3 }).map((_, index) => <PostSkeleton key={index} />)
     );
 
     const renderFeedContent = () => {
-        if (status === 'pending') {
+        if (status === 'pending' || (isFetching && !isFetchingNextPage)) {
             return renderSkeletons();
         }
         if (status === 'error') {
@@ -82,12 +132,31 @@ const SocialFeed = () => {
                 transition={{ duration: 0.5 }}
             >
                 {allPosts.length > 0 ? (
-                    allPosts.map(post => (
-                        <WeChatPostCard key={post.id} post={post} onPostUpdated={refetch} onDeletePost={refetch} />
-                    ))
+                    <div style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+                        {virtualItems.map((v) => {
+                            const post = allPosts[v.index];
+                            if (!post) return null;
+                            return (
+                                <div
+                                    key={post.id ?? v.key}
+                                    ref={rowVirtualizer.measureElement}
+                                    data-index={v.index}
+                                    style={{
+                                        position: 'absolute',
+                                        top: 0,
+                                        left: 0,
+                                        width: '100%',
+                                        transform: `translateY(${v.start}px)`,
+                                    }}
+                                >
+                                    <WeChatPostCard key={post.id} post={post} onPostUpdated={handlePostUpdated} onDeletePost={handleDeletePost} />
+                                </div>
+                            );
+                        })}
+                    </div>
                 ) : (
                     <div className="text-center py-20">
-                        <p className="text-muted-foreground">内容加载中或尚未发布动态。</p>
+                        <p className="text-muted-foreground">这里还没有内容，快来发布第一条吧！</p>
                     </div>
                 )}
                  {!user && <NotLoggedInPrompt />}

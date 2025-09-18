@@ -14,13 +14,35 @@ const Avatar = React.forwardRef(({ className, ...props }, ref) => (
 ));
 Avatar.displayName = AvatarPrimitive.Root.displayName;
 
-const AvatarImage = React.forwardRef(({ className, ...props }, ref) => (
+const isBlockedAvatarSrc = (src) => {
+  if (typeof src !== 'string' || !src) return false;
+  try {
+    const u = new URL(src, window.location.origin);
+    return u.hostname === 'i.pravatar.cc';
+  } catch {
+    return src.includes('i.pravatar.cc');
+  }
+};
+
+const AvatarImage = React.forwardRef(({ className, onError, src, ...props }, ref) => {
+  const finalSrc = isBlockedAvatarSrc(src) ? '/avatar-fallback.png' : src;
+  return (
   <AvatarPrimitive.Image
     ref={ref}
     className={cn('aspect-square h-full w-full', className)}
+      src={finalSrc}
+      loading="lazy"
+      decoding="async"
+      onError={(e) => {
+        if (onError) onError(e);
+        if (e.currentTarget?.src !== '/avatar-fallback.png') {
+          e.currentTarget.src = '/avatar-fallback.png';
+        }
+      }}
     {...props}
   />
-));
+  );
+});
 AvatarImage.displayName = AvatarPrimitive.Image.displayName;
 
 const AvatarFallback = React.forwardRef(({ className, ...props }, ref) => (

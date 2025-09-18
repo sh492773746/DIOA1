@@ -27,6 +27,7 @@ const ImageLightbox = ({ isOpen, onOpenChange, imageUrl, children }) => {
                         src={imageUrl}
                         alt="Enlarged view"
                         className="max-w-full max-h-full object-contain"
+                        decoding="async"
                         onClick={(e) => e.stopPropagation()}
                     />
                 </motion.div>

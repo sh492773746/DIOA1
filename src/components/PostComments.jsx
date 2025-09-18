@@ -8,8 +8,8 @@ import { Button } from '@/components/ui/button';
 import { formatDistanceToNow } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { useAuth } from '@/contexts/SupabaseAuthContext';
-import { supabase as supabaseClient } from '@/lib/customSupabaseClient';
 import { useQueryClient } from '@tanstack/react-query';
+import { useVirtualizer } from '@tanstack/react-virtual';
 
 const COMMENT_MAX_LENGTH = 200;
 const INITIAL_VISIBLE_COMMENTS = 2;
@@ -56,7 +56,7 @@ const StandardCommentItem = ({ comment, user, onDelete }) => {
             className="flex items-start space-x-2 group"
         >
             <Avatar className="w-7 h-7">
-                <AvatarImage src={authorAvatarUrl} alt={authorUsername} />
+                <AvatarImage src={authorAvatarUrl} alt={authorUsername} onError={(e) => { e.currentTarget.src = '/avatar-fallback.png'; }} />
                 <AvatarFallback>{authorUsername?.[0]?.toUpperCase()}</AvatarFallback>
             </Avatar>
             <div className="flex-1">
@@ -91,6 +91,7 @@ const PostComments = ({ postId, initialComments = [], onCommentCreated, isWeChat
     
     const commentCost = parseInt(siteSettings?.comment_cost || '1', 10);
     const [comments, setComments] = useState(initialComments);
+    const sharedMode = String(siteSettings?.social_forum_mode || '').toLowerCase() === 'shared';
 
     useEffect(() => {
         setComments(initialComments);
@@ -102,58 +103,53 @@ const PostComments = ({ postId, initialComments = [], onCommentCreated, isWeChat
 
         setIsSubmitting(true);
         try {
-            const { data, error } = await supabaseClient.rpc('create_comment_and_deduct_points', {
-                p_post_id: postId,
-                p_user_id: user.id,
-                p_content: newComment.trim()
+            const res = await fetch(sharedMode ? '/api/shared/comments' : '/api/comments', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${localStorage.getItem('sb-access-token') || ''}` },
+                body: JSON.stringify({ postId, content: newComment.trim() })
             });
-
-            if (error) throw error;
-            
-            const newCommentWithAuthor = data[0];
-            
-            // Use the callback to update parent state
+            if (!res.ok) throw new Error('failed');
+            const data = await res.json();
+            const newCommentWithAuthor = data;
             onCommentCreated(newCommentWithAuthor);
-            
-            // Also update local state for immediate feedback
             setComments(prev => [newCommentWithAuthor, ...prev]);
-            
             setNewComment('');
             toast({ title: '评论成功' });
-            
-            // Invalidate queries to ensure data consistency across the app
             queryClient.invalidateQueries({ queryKey: ['socialFeed', tenantId, user?.id] });
             queryClient.invalidateQueries({ queryKey: ['userPosts', user.id] });
-
-
         } catch (error) {
-            toast({
-                variant: 'destructive',
-                title: '评论失败',
-                description: error.message,
-            });
+            toast({ variant: 'destructive', title: '评论失败', description: error.message });
         } finally {
             setIsSubmitting(false);
         }
     };
 
     const handleDeleteComment = async (commentId) => {
-        const { error } = await supabaseClient.from('comments').delete().match({ id: commentId, user_id: user.id });
-
-        if (error) {
-            toast({ variant: 'destructive', title: '删除失败', description: error.message });
-        } else {
+        try {
+            const res = await fetch(sharedMode ? `/api/shared/comments/${commentId}` : `/api/comments/${commentId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${localStorage.getItem('sb-access-token') || ''}` } });
+            if (!res.ok) throw new Error('failed');
             onCommentDeleted(commentId);
             setComments(prev => prev.filter(c => c.id !== commentId));
             toast({ title: '评论已删除' });
             queryClient.invalidateQueries({ queryKey: ['socialFeed', tenantId, user?.id] });
             queryClient.invalidateQueries({ queryKey: ['userPosts', user.id] });
+        } catch (error) {
+            toast({ variant: 'destructive', title: '删除失败', description: error.message });
         }
     };
 
     const visibleComments = useMemo(() => {
         return isExpanded ? comments : comments.slice(0, INITIAL_VISIBLE_COMMENTS);
     }, [comments, isExpanded]);
+
+    const shouldVirtualize = isExpanded && visibleComments.length > 50;
+    const containerRef = React.useRef(null);
+    const rowVirtualizer = useVirtualizer({
+        count: shouldVirtualize ? visibleComments.length : 0,
+        getScrollElement: () => containerRef.current,
+        estimateSize: () => 44,
+        overscan: 8,
+    });
 
     const handleToggleExpand = () => {
         setIsExpanded(prev => !prev);
@@ -163,10 +159,30 @@ const PostComments = ({ postId, initialComments = [], onCommentCreated, isWeChat
         return (
              <div className="pt-2">
                 <AnimatePresence>
-                    {visibleComments.map((comment) => (
+                    {!shouldVirtualize && visibleComments.map((comment) => (
                          <CommentItem key={comment.id} comment={comment} user={user} onDelete={handleDeleteComment} />
                     ))}
                 </AnimatePresence>
+                {shouldVirtualize && (
+                    <div ref={containerRef} className="max-h-96 overflow-auto">
+                        <div style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+                            {rowVirtualizer.getVirtualItems().map((v) => {
+                                const comment = visibleComments[v.index];
+                                if (!comment) return null;
+                                return (
+                                    <div
+                                        key={comment.id ?? v.key}
+                                        ref={rowVirtualizer.measureElement}
+                                        data-index={v.index}
+                                        style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${v.start}px)` }}
+                                    >
+                                        <CommentItem comment={comment} user={user} onDelete={handleDeleteComment} />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
                 {comments.length > INITIAL_VISIBLE_COMMENTS && (
                     <Button
                         variant="link"
@@ -203,7 +219,7 @@ const PostComments = ({ postId, initialComments = [], onCommentCreated, isWeChat
             {user && (
                 <form onSubmit={handleSubmitComment} className="flex items-center space-x-2 mb-2">
                     <Avatar className="w-7 h-7">
-                        <AvatarImage src={profile?.avatar_url} alt={profile?.username} />
+                        <AvatarImage src={profile?.avatar_url} alt={profile?.username} onError={(e) => { e.currentTarget.src = '/avatar-fallback.png'; }} />
                         <AvatarFallback>{profile?.username?.[0]?.toUpperCase()}</AvatarFallback>
                     </Avatar>
                     <Input
@@ -221,10 +237,30 @@ const PostComments = ({ postId, initialComments = [], onCommentCreated, isWeChat
             )}
             <div className="space-y-2">
                 <AnimatePresence>
-                    {visibleComments.map((comment) => (
+                    {!shouldVirtualize && visibleComments.map((comment) => (
                         <StandardCommentItem key={comment.id} comment={comment} user={user} onDelete={handleDeleteComment} />
                     ))}
                 </AnimatePresence>
+                {shouldVirtualize && (
+                    <div ref={containerRef} className="max-h-96 overflow-auto">
+                        <div style={{ height: rowVirtualizer.getTotalSize(), position: 'relative' }}>
+                            {rowVirtualizer.getVirtualItems().map((v) => {
+                                const comment = visibleComments[v.index];
+                                if (!comment) return null;
+                                return (
+                                    <div
+                                        key={comment.id ?? v.key}
+                                        ref={rowVirtualizer.measureElement}
+                                        data-index={v.index}
+                                        style={{ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${v.start}px)` }}
+                                    >
+                                        <StandardCommentItem comment={comment} user={user} onDelete={handleDeleteComment} />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
                  {comments.length > INITIAL_VISIBLE_COMMENTS && (
                     <Button
                         variant="link"

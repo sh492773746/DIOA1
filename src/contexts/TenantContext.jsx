@@ -18,14 +18,14 @@ export const TenantProvider = ({ children }) => {
       const host = window.location.hostname;
       const idFromHost = await getTenantIdByHostname(host);
       
-      setActiveTenantId(prev => (prev === idFromHost ? prev : idFromHost));
+      setActiveTenantId(idFromHost);
       logTenantInfo(host, idFromHost);
       
       setIsLoading(false);
     };
 
     identifyTenant();
-  }, []); 
+  }, [logTenantInfo]); 
   
   const value = useMemo(() => ({
       activeTenantId,

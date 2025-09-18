@@ -2,167 +2,3357 @@ import 'dotenv/config';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { createClient } from '@libsql/client';
+import { drizzle } from 'drizzle-orm/libsql';
+import { profiles, appSettings, pageContent as pageContentTable, tenantRequests as tenantRequestsTable, posts as postsTable, notifications as notificationsTable, comments as commentsTable, adminUsers as adminUsersTable, likes as likesTable, tenantAdmins as tenantAdminsTable, branches as branchesTable } from './drizzle/schema.js';
+import { sharedPosts, sharedComments, sharedLikes, sharedProfiles } from './drizzle/schema.js';
+import { shopProducts, shopRedemptions, invitations } from './drizzle/schema.js';
+import { pointsHistory as pointsHistoryTable } from './drizzle/schema.js';
+import { eq, and, inArray, desc, sql } from 'drizzle-orm';
+import { jwtVerify, decodeJwt, createRemoteJWKSet } from 'jose';
+import { cors } from 'hono/cors';
+import { secureHeaders } from 'hono/secure-headers';
+import { compress } from 'hono/compress';
+import { createBranch } from './tursoApi.js';
+import { pageConfig } from '../src/config/pageContentConfig.js';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
 
 const app = new Hono();
 
-function getClient(url) {
-  const authToken = process.env.TURSO_AUTH_TOKEN;
-	if (!url || !authToken) throw new Error('Turso env not set');
-	return createClient({ url, authToken });
+// Secure headers
+app.use('*', secureHeaders());
+
+// Compression
+app.use('*', compress());
+
+// CORS allowlist
+const ROOT = process.env.NEXT_PUBLIC_ROOT_DOMAIN || '';
+const allow = new Set([
+  `http://${ROOT}`,
+  `https://${ROOT}`,
+  'http://localhost:3000',
+  'http://localhost:5173',
+]);
+app.use('*', cors({
+  origin: (origin) => {
+    if (!origin) return true;
+    if (allow.has(origin)) return true;
+    if (ROOT && origin.endsWith(`.${ROOT}`)) return true;
+    return false;
+  },
+  allowMethods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowHeaders: ['Authorization','Content-Type'],
+  credentials: false,
+}));
+
+// Supabase JWT verification (JOSE JWKS)
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+const supabaseIssuer = supabaseUrl ? `${supabaseUrl.replace(/\/$/, '')}/auth/v1` : null;
+const SUPABASE_JWKS = supabaseUrl ? createRemoteJWKSet(new URL(`${supabaseIssuer}/keys`)) : null;
+
+const runtimeBranchMap = {};
+
+// --- Rate limiting & helpers ---
+const __rateStore = new Map();
+function __getClientKey(c) {
+  const uid = c.get('userId') || '';
+  const fwd = c.req.header('x-forwarded-for') || '';
+  const ip = (fwd.split(',')[0] || '').trim() || c.req.header('x-real-ip') || c.req.header('cf-connecting-ip') || '';
+  return `${uid}|${ip}`;
+}
+function __isLimited(key, limit, windowMs) {
+  const now = Date.now();
+  const bucket = __rateStore.get(key) || { count: 0, reset: now + windowMs };
+  if (now > bucket.reset) { bucket.count = 0; bucket.reset = now + windowMs; }
+  bucket.count++;
+  __rateStore.set(key, bucket);
+  return bucket.count > limit;
+}
+const __writeLimiter = async (c, next) => {
+  const m = (c.req.method || 'GET').toUpperCase();
+  if (m === 'POST' || m === 'PUT' || m === 'DELETE') {
+    const key = `w:${__getClientKey(c)}`;
+    if (__isLimited(key, 20, 10_000)) return c.json({ error: 'too-many-requests' }, 429);
+  }
+  await next();
+};
+const __uploadLimiter = async (c, next) => {
+  const m = (c.req.method || 'GET').toUpperCase();
+  if (m === 'POST') {
+    const key = `u:${__getClientKey(c)}`;
+    if (__isLimited(key, 5, 10_000)) return c.json({ error: 'too-many-requests' }, 429);
+  }
+  await next();
+};
+function __isAllowedImage(type) {
+  const t = String(type || '').toLowerCase();
+  return t === 'image/jpeg' || t === 'image/png' || t === 'image/webp' || t === 'image/gif';
+}
+function __setCache(c, seconds) {
+  c.header('Cache-Control', `public, max-age=${seconds}, stale-while-revalidate=${seconds * 5}`);
 }
 
-function getPrimary() {
-  const url = process.env.TURSO_PRIMARY_URL || process.env.TURSO_DATABASE_URL;
-	return getClient(url);
+app.use('/api', __writeLimiter);
+app.use('/api/uploads', __uploadLimiter);
+
+async function getBranchUrlForTenant(tenantId) {
+  if (!tenantId) return null;
+  try {
+    // 1) DB mapping
+    const db = getGlobalDb();
+    const rows = await db.select().from(branchesTable).where(eq(branchesTable.tenantId, tenantId)).limit(1);
+    if (rows && rows[0]?.branchUrl) return rows[0].branchUrl;
+  } catch {}
+  // 2) runtime map
+  if (runtimeBranchMap && runtimeBranchMap[String(tenantId)]) return runtimeBranchMap[String(tenantId)];
+  // 3) env fallback
+  try {
+    const map = process.env.TURSO_BRANCH_MAP ? JSON.parse(process.env.TURSO_BRANCH_MAP) : {};
+    if (map && map[String(tenantId)]) return map[String(tenantId)];
+  } catch {}
+  return null;
 }
+
+async function getTursoClientForTenant(tenantId) {
+  const branchUrl = await getBranchUrlForTenant(tenantId);
+  const url = branchUrl || process.env.TURSO_DATABASE_URL || process.env.TURSO_PRIMARY_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (!url || !authToken) throw new Error('Turso server env not set');
+  const client = createClient({ url, authToken });
+  return drizzle(client);
+}
+
+function getGlobalDb() {
+  const url = process.env.TURSO_PRIMARY_URL || process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (!url || !authToken) throw new Error('Turso server env not set');
+  const client = createClient({ url, authToken });
+  return drizzle(client);
+}
+
+// Raw libSQL helpers
+function getGlobalClient() {
+  const url = process.env.TURSO_PRIMARY_URL || process.env.TURSO_DATABASE_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (!url || !authToken) throw new Error('Turso server env not set');
+  return createClient({ url, authToken });
+}
+
+async function getLibsqlClientForTenantRaw(tenantId) {
+  const branchUrl = await getBranchUrlForTenant(tenantId);
+  const url = branchUrl || process.env.TURSO_DATABASE_URL || process.env.TURSO_PRIMARY_URL;
+  const authToken = process.env.TURSO_AUTH_TOKEN;
+  if (!url || !authToken) throw new Error('Turso server env not set');
+  return createClient({ url, authToken });
+}
+
+async function ensureTenantRequestsSchemaRaw(client) {
+  const alters = [
+    "alter table tenant_requests add column user_id text",
+    "alter table tenant_requests add column contact_wangwang text",
+    "alter table tenant_requests add column status text",
+    "alter table tenant_requests add column vercel_project_id text",
+    "alter table tenant_requests add column vercel_assigned_domain text",
+    "alter table tenant_requests add column vercel_deployment_status text",
+    "alter table tenant_requests add column created_at text",
+    "alter table tenant_requests add column rejection_reason text"
+  ];
+  for (const s of alters) {
+    try { await client.execute(s); } catch {}
+  }
+}
+
+function getSupabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('Supabase env not set');
+  return createSupabaseClient(url, key, { auth: { persistSession: false, autoRefreshToken: false } });
+}
+
+async function ensureBucketPublic(supabase, bucket) {
+  try {
+    const { data } = await supabase.storage.getBucket(bucket);
+    if (!data) {
+      await supabase.storage.createBucket(bucket, { public: true, fileSizeLimit: 52428800 });
+    } else {
+      try { await supabase.storage.updateBucket(bucket, { public: true }); } catch {}
+    }
+  } catch {
+    // If getBucket not supported on self-hosted, fallback to create
+    try { await supabase.storage.createBucket(bucket, { public: true, fileSizeLimit: 52428800 }); } catch {}
+  }
+}
+
+// auth + tenant middleware
+app.use('*', async (c, next) => {
+  const host = c.req.header('x-forwarded-host') || c.req.header('host') || '';
+  c.set('host', host);
+
+  const auth = c.req.header('authorization');
+  if (auth?.startsWith('Bearer ')) {
+    const token = auth.slice(7);
+    try {
+      if (SUPABASE_JWKS && supabaseIssuer) {
+        const { payload } = await jwtVerify(token, SUPABASE_JWKS, { issuer: supabaseIssuer });
+        c.set('userId', payload?.sub || null);
+      } else {
+      const payload = decodeJwt(token);
+      c.set('userId', payload?.sub || null);
+      }
+    } catch {
+      c.set('userId', null);
+    }
+  }
+  await next();
+});
 
 app.get('/health', (c) => c.json({ ok: true }));
-app.get('/api/health', (c) => c.json({ ok: true }));
 
-// Settings (with and without /api prefix)
-app.get('/settings', async (c) => {
+app.get('/api/auth/debug', (c) => {
+  if (process.env.NODE_ENV === 'production') return c.json({ ok: false }, 404);
+  return c.json({ userId: c.get('userId') || null });
+});
+
+app.get('/api/debug/tenant', async (c) => {
+  if (process.env.NODE_ENV === 'production') return c.json({ ok: false }, 404);
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = (c.get('host') || '').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const branchUrl = await getBranchUrlForTenant(tenantId);
+    return c.json({ host, tenantId, branchUrl: branchUrl || null });
+  } catch (e) {
+    return c.json({ host: c.get('host') || null, tenantId: null, branchUrl: null });
+  }
+});
+
+app.post('/api/uploads/post-images', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const form = await c.req.formData();
+    const files = [];
+    for (const [key, value] of form.entries()) {
+      if (key === 'files' && value && typeof value === 'object') {
+        files.push(value);
+      }
+    }
+    if (files.length === 0) return c.json({ error: 'no-files' }, 400);
+
+    // Upload validation: limit count, size, mime
+    if (files.length > 10) return c.json({ error: 'too-many-files' }, 400);
+    const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+    for (const f of files) {
+      const typeOk = __isAllowedImage(f.type);
+      if (!typeOk) return c.json({ error: 'unsupported-type' }, 415);
+      const size = Number(f.size || 0);
+      if (size > MAX_SIZE) return c.json({ error: 'file-too-large' }, 413);
+    }
+
+    const supa = getSupabaseAdmin();
+    const bucket = 'post-images';
+    await ensureBucketPublic(supa, bucket);
+
+    const urls = [];
+    for (const file of files) {
+      const safeName = (file.name || 'image').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const objectPath = `${userId}/${Date.now()}_${safeName}`;
+      const { error: upErr } = await supa.storage
+        .from(bucket)
+        .upload(objectPath, file, { contentType: file.type || 'application/octet-stream', cacheControl: '3600', upsert: false });
+      if (upErr) {
+        if (String(upErr.message || '').includes('exists')) {
+          const { data: { publicUrl } } = supa.storage.from(bucket).getPublicUrl(objectPath);
+          urls.push(publicUrl);
+          continue;
+        }
+        throw upErr;
+      }
+      const { data: { publicUrl } } = supa.storage.from(bucket).getPublicUrl(objectPath);
+      urls.push(publicUrl);
+    }
+    return c.json({ urls });
+  } catch (e) {
+    console.error('POST /api/uploads/post-images error', e);
+    return c.json({ error: 'upload-failed' }, 500);
+  }
+});
+
+// Single avatar upload
+app.post('/api/uploads/avatar', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const form = await c.req.formData();
+    const file = form.get('file');
+    if (!file || typeof file !== 'object') return c.json({ error: 'no-file' }, 400);
+
+    // Upload validation: size, type
+    const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+    if (!__isAllowedImage(file.type)) return c.json({ error: 'unsupported-type' }, 415);
+    const size = Number(file.size || 0);
+    if (size > MAX_SIZE) return c.json({ error: 'file-too-large' }, 413);
+
+    const supa = getSupabaseAdmin();
+    const bucket = 'avatars';
+    await ensureBucketPublic(supa, bucket);
+    const safeName = (file.name || 'avatar').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const objectPath = `${userId}/${Date.now()}_${safeName}`;
+    const { error: upErr } = await supa.storage
+      .from(bucket)
+      .upload(objectPath, file, { contentType: file.type || 'application/octet-stream', cacheControl: '3600', upsert: true });
+    if (upErr) throw upErr;
+    const { data: { publicUrl } } = supa.storage.from(bucket).getPublicUrl(objectPath);
+    return c.json({ url: publicUrl });
+  } catch (e) {
+    console.error('POST /api/uploads/avatar error', e);
+    return c.json({ error: 'upload-failed' }, 500);
+  }
+});
+
+// Resumable upload endpoints
+const UP_TMP = process.env.UPLOAD_TMP_DIR || path.join(process.cwd(), 'tmp_uploads');
+function ensureTmpDir() { try { fs.mkdirSync(UP_TMP, { recursive: true }); } catch {} }
+
+app.post('/api/uploads/resumable/init', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { filename } = await c.req.json();
+    const uploadId = `${userId}_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    ensureTmpDir();
+    return c.json({ uploadId });
+  } catch (e) {
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/uploads/resumable/chunk', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const form = await c.req.formData();
+    const uploadId = String(form.get('uploadId') || '');
+    const index = Number(form.get('index') || 0);
+    const total = Number(form.get('total') || 0);
+    const chunk = form.get('chunk');
+    if (!uploadId || !chunk || typeof chunk !== 'object') return c.json({ error: 'invalid' }, 400);
+    ensureTmpDir();
+    const p = path.join(UP_TMP, `${uploadId}_${index}.part`);
+    const buf = Buffer.from(await chunk.arrayBuffer());
+    fs.writeFileSync(p, buf);
+    return c.json({ ok: true, index, total });
+  } catch (e) {
+    console.error('POST /api/uploads/resumable/chunk error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/uploads/resumable/finish', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { uploadId, filename, bucket = 'post-images', contentType } = await c.req.json();
+    if (!uploadId || !filename) return c.json({ error: 'invalid' }, 400);
+    ensureTmpDir();
+    // read parts
+    const partFiles = fs.readdirSync(UP_TMP).filter(f => f.startsWith(`${uploadId}_`) && f.endsWith('.part'));
+    if (partFiles.length === 0) return c.json({ error: 'no-chunks' }, 400);
+    const indices = partFiles.map(f => Number(f.split('_').pop().replace('.part',''))).sort((a,b) => a-b);
+    const tmpMerged = path.join(UP_TMP, `${uploadId}_merged`);
+    const write = fs.createWriteStream(tmpMerged);
+    for (const idx of indices) {
+      const p = path.join(UP_TMP, `${uploadId}_${idx}.part`);
+      write.write(fs.readFileSync(p));
+    }
+    write.end();
+    await new Promise(r => write.on('close', r));
+    // upload to supabase
+    const supa = getSupabaseAdmin();
+    await ensureBucketPublic(supa, bucket);
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const objectPath = `${userId}/${Date.now()}_${safeName}`;
+    const fileBuf = fs.readFileSync(tmpMerged);
+    const { error: upErr } = await supa.storage
+      .from(bucket)
+      .upload(objectPath, fileBuf, { contentType: contentType || 'application/octet-stream', cacheControl: '3600', upsert: false });
+    if (upErr) throw upErr;
+    const { data: { publicUrl } } = supa.storage.from(bucket).getPublicUrl(objectPath);
+    // cleanup
+    try { fs.unlinkSync(tmpMerged); } catch {}
+    for (const idx of indices) { try { fs.unlinkSync(path.join(UP_TMP, `${uploadId}_${idx}.part`)); } catch {} }
+    return c.json({ url: publicUrl });
+  } catch (e) {
+    console.error('POST /api/uploads/resumable/finish error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// Cleanup stale chunks (admin)
+app.post('/api/admin/uploads/cleanup', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    ensureTmpDir();
+    const now = Date.now();
+    let removed = 0;
+    for (const f of fs.readdirSync(UP_TMP)) {
+      if (!f.endsWith('.part') && !f.endsWith('_merged')) continue;
+      const p = path.join(UP_TMP, f);
+      try {
+        const st = fs.statSync(p);
+        if (now - st.mtimeMs > 24 * 3600 * 1000) { // older than 24h
+          fs.unlinkSync(p);
+          removed++;
+        }
+      } catch {}
+    }
+    return c.json({ ok: true, removed });
+  } catch (e) {
+    console.error('POST /api/admin/uploads/cleanup error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+// Profile update (username, avatar)
+app.put('/api/profile', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const body = await c.req.json();
+    const { username, avatarUrl } = body || {};
+    const db = await getTursoClientForTenant(0);
+    const updates = {};
+    if (username !== undefined) updates.username = String(username);
+    if (avatarUrl !== undefined) updates.avatarUrl = String(avatarUrl);
+    if (Object.keys(updates).length === 0) return c.json({ ok: false, error: 'no-op' }, 400);
+    await db.update(profiles).set(updates).where(eq(profiles.id, userId));
+    // sync shared_profiles avatar/username if exists
+    try {
+      const g = getGlobalDb();
+      const exists = await g.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1);
+      if (exists && exists.length > 0) {
+        const upd = {};
+        if (username !== undefined) upd.username = String(username);
+        if (avatarUrl !== undefined) upd.avatarUrl = String(avatarUrl);
+        if (Object.keys(upd).length > 0) await g.update(sharedProfiles).set(upd).where(eq(sharedProfiles.id, userId));
+      }
+    } catch {}
+    const rows = await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    return c.json(rows?.[0] || { ok: true });
+  } catch (e) {
+    console.error('PUT /api/profile error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+async function resolveTenantId(db, host) {
+  try {
+    const row = await db
+      .select({ id: tenantRequestsTable.id })
+      .from(tenantRequestsTable)
+      .where(eq(tenantRequestsTable.desiredDomain, host))
+      .limit(1);
+    return row?.[0]?.id ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Bootstrap first super admin when none exists
+app.post('/api/admin/bootstrap-super-admin', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ ok: false, error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const cnt = await db.select({ c: sql`count(1)` }).from(adminUsersTable);
+    const count = Number(cnt?.[0]?.c || 0);
+    if (count > 0) {
+      return c.json({ ok: false, reason: 'already-initialized' });
+    }
+    await db.insert(adminUsersTable).values({ userId });
+    return c.json({ ok: true, userId });
+  } catch (e) {
+    console.error('POST /api/admin/bootstrap-super-admin error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/fix-profile-id', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ ok: false, error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    // Try to find profile by this id first
+    const byId = await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    if ((byId || []).length > 0) return c.json({ ok: true, updated: false });
+    // If not present, there's no guaranteed email in JWT，所以这里只提供直接插入一条最小资料
+    await db.insert(profiles).values({ id: userId, username: '用户', tenantId: 0, points: 0, createdAt: new Date().toISOString() });
+    return c.json({ ok: true, updated: true });
+  } catch (e) {
+    console.error('POST /api/admin/fix-profile-id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/profile', async (c) => {
+  try {
+    const userId = c.req.query('userId');
+    const ensure = c.req.query('ensure') === '1';
+    if (!userId) return c.json({}, 400);
+
+    const authedUserId = c.get('userId') || null;
+    const isSelf = !!authedUserId && String(authedUserId) === String(userId);
+
+    // resolve tenant
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = (c.get('host') || '').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const tenantDb = await getTursoClientForTenant(tenantId);
+    const globalDb = await getTursoClientForTenant(0);
+
+    // Backward-compat: ensure optional columns exist in both tenant and global profiles
+    try {
+      const rawT = await getLibsqlClientForTenantRaw(tenantId);
+      try { await rawT.execute("alter table profiles add column avatar_url text"); } catch {}
+      try { await rawT.execute("alter table profiles add column tenant_id integer default 0"); } catch {}
+      try { await rawT.execute("alter table profiles add column uid text"); } catch {}
+      try { await rawT.execute("alter table profiles add column invite_code text"); } catch {}
+      try { await rawT.execute("alter table profiles add column virtual_currency integer default 0"); } catch {}
+      try { await rawT.execute("alter table profiles add column invitation_points integer default 0"); } catch {}
+      try { await rawT.execute("alter table profiles add column free_posts_count integer default 0"); } catch {}
+    } catch {}
+    try {
+      const rawG = getGlobalClient();
+      try { await rawG.execute("alter table profiles add column avatar_url text"); } catch {}
+      try { await rawG.execute("alter table profiles add column tenant_id integer default 0"); } catch {}
+      try { await rawG.execute("alter table profiles add column uid text"); } catch {}
+      try { await rawG.execute("alter table profiles add column invite_code text"); } catch {}
+      try { await rawG.execute("alter table profiles add column virtual_currency integer default 0"); } catch {}
+      try { await rawG.execute("alter table profiles add column invitation_points integer default 0"); } catch {}
+      try { await rawG.execute("alter table profiles add column free_posts_count integer default 0"); } catch {}
+    } catch {}
+
+    // ensure tenant profile exists (for points/virtual currency scoped to tenant)
+    let rowsTenant = await tenantDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    if (ensure && isSelf && (!rowsTenant || rowsTenant.length === 0)) {
+      const map = await readSettingsMap();
+      await tenantDb.insert(profiles).values({
+        id: userId,
+        username: '用户',
+        tenantId: tenantId,
+        points: toInt(map['new_user_points'], 0),
+        virtualCurrency: toInt(map['initial_virtual_currency'], 0),
+        invitationPoints: 0,
+        freePostsCount: toInt(map['new_user_free_posts'], 0),
+        createdAt: new Date().toISOString()
+      });
+      rowsTenant = await tenantDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    }
+
+    // ensure global profile exists for invite/uid
+    let rowsGlobal = await globalDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    if (ensure && isSelf && (!rowsGlobal || rowsGlobal.length === 0)) {
+      await globalDb.insert(profiles).values({ id: userId, username: '用户', tenantId: 0, points: 0, virtualCurrency: 0, invitationPoints: 0, freePostsCount: 0, createdAt: new Date().toISOString() });
+      rowsGlobal = await globalDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    }
+
+    const pTenant = rowsTenant?.[0] || null;
+    const pGlobal = rowsGlobal?.[0] || null;
+
+    if (pGlobal) {
+      // ensure uid and invite_code in global
+      await ensureUid(globalDb, profiles, profiles.id, userId);
+      await ensureInviteCode(globalDb, profiles, profiles.id, userId);
+    }
+
+    // reread global for latest uid/invite
+    const rereadGlobal = (await globalDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0] || pGlobal;
+
+    // compute invited users count across tenant and global invitations
+    let invitedUsersCount = 0;
+    try {
+      const invGlobal = await globalDb.select().from(invitations).where(eq(invitations.inviterId, userId));
+      const inviteeIds = Array.isArray(invGlobal)
+        ? Array.from(new Set(
+            (invGlobal || [])
+              .map(r => r?.inviteeId)
+              .filter(Boolean)
+              .filter(inviteeId => String(inviteeId) !== String(userId))
+          ))
+        : [];
+      if (inviteeIds.length > 0) {
+        const existingInvitees = await globalDb
+          .select({ id: profiles.id })
+          .from(profiles)
+          .where(inArray(profiles.id, inviteeIds));
+        invitedUsersCount = Array.isArray(existingInvitees) ? existingInvitees.length : 0;
+      } else {
+        invitedUsersCount = 0;
+      }
+    } catch {}
+
+    // compute invitation points strictly for this user from points history (tenant-scoped)
+    let invitationPointsComputed = 0;
+    try {
+      const sumRows = await tenantDb
+        .select({ total: sql`sum(${pointsHistoryTable.changeAmount})` })
+        .from(pointsHistoryTable)
+        .where(and(eq(pointsHistoryTable.userId, userId), eq(pointsHistoryTable.reason, '邀请好友奖励')))
+        .limit(1);
+      const total = Array.isArray(sumRows) && sumRows[0] && (sumRows[0].total ?? sumRows[0].TOTAL ?? sumRows[0]['sum'] ?? 0);
+      const asNumber = Number(total || 0);
+      if (Number.isFinite(asNumber)) invitationPointsComputed = asNumber;
+    } catch {}
+
+    // Auto-invite reward on first ensured profile when cookie is present (only when fetching self profile)
+    try {
+      if (isSelf) {
+      const rawCookie = String(c.req.header('cookie') || '');
+      const cookies = new Map();
+      for (const part of rawCookie.split(';')) {
+        const idx = part.indexOf('=');
+        if (idx > -1) {
+          const k = part.slice(0, idx).trim();
+          const v = part.slice(idx + 1).trim();
+          cookies.set(k, decodeURIComponent(v));
+        }
+      }
+      const inviterId = cookies.get('inviter_id');
+      if (inviterId && inviterId !== userId) {
+        // Check global invitations to ensure idempotency across tenants
+        const exists = await globalDb.select().from(invitations).where(and(eq(invitations.inviteeId, userId), eq(invitations.inviterId, inviterId))).limit(1);
+        if (!exists || exists.length === 0) {
+          const nowIso = new Date().toISOString();
+          // record invitation in GLOBAL DB for analytics
+          try { await globalDb.insert(invitations).values({ tenantId, inviteeId: userId, inviterId, createdAt: nowIso }); } catch {}
+          // reward inviter in CURRENT TENANT DB (create profile if missing)
+          try {
+            const map = await readSettingsMap();
+            const reward = toInt(map['invite_reward_points'], 50);
+            const invDb = await getTursoClientForTenant(tenantId);
+            let inviterProf = (await invDb.select().from(profiles).where(eq(profiles.id, inviterId)).limit(1))?.[0];
+            if (!inviterProf) {
+              await invDb.insert(profiles).values({ id: inviterId, username: '用户', tenantId, points: 0, createdAt: nowIso });
+              inviterProf = (await invDb.select().from(profiles).where(eq(profiles.id, inviterId)).limit(1))?.[0];
+            }
+            await invDb.update(profiles).set({ points: (inviterProf?.points || 0) + reward, invitationPoints: (inviterProf?.invitationPoints || 0) + reward }).where(eq(profiles.id, inviterId));
+            try { const rawT = await getLibsqlClientForTenantRaw(tenantId); await rawT.execute("create table if not exists points_history (id integer primary key autoincrement, user_id text not null, change_amount integer not null, reason text not null, created_at text default (datetime('now')))"); } catch {}
+            try { await invDb.insert(pointsHistoryTable).values({ userId: inviterId, changeAmount: reward, reason: '邀请好友奖励', createdAt: nowIso }); } catch {}
+          } catch {}
+          // clear cookie
+          try { c.header('Set-Cookie', 'inviter_id=; Path=/; Max-Age=0; SameSite=Lax'); } catch {}
+          }
+        }
+      }
+    } catch {}
+
+    if (pTenant) {
+      const compat = {
+        ...pTenant,
+        // prefer tenant-scoped values
+        avatar_url: pTenant.avatarUrl,
+        tenant_id: pTenant.tenantId,
+        virtual_currency: pTenant.virtualCurrency,
+        invitation_points: invitationPointsComputed,
+        free_posts_count: pTenant.freePostsCount,
+        invited_users_count: invitedUsersCount,
+        // merge global-only codes
+        uid: rereadGlobal?.uid || pTenant.uid,
+        invite_code: rereadGlobal?.inviteCode || pTenant.inviteCode,
+      };
+      return c.json(compat);
+    }
+
+    // fallback to global-only data if tenant profile is missing and not ensured
+    if (pGlobal) {
+      const compat = {
+        ...pGlobal,
+        avatar_url: pGlobal.avatarUrl,
+        tenant_id: pGlobal.tenantId,
+        virtual_currency: pGlobal.virtualCurrency,
+        invitation_points: invitationPointsComputed,
+        free_posts_count: pGlobal.freePostsCount,
+        invite_code: pGlobal.inviteCode,
+        invited_users_count: invitedUsersCount,
+      };
+      return c.json(compat);
+    }
+
+    return c.json({});
+  } catch (e) {
+    console.error('GET /api/profile error', e);
+    return c.json({});
+  }
+});
+
+app.get('/api/settings', async (c) => {
+  __setCache(c, 60);
   try {
     const scope = c.req.query('scope') || 'merged';
-		const client = getPrimary();
     if (scope === 'main') {
-			const { rows } = await client.execute("select key, value from app_settings where tenant_id = 0");
+      const dbMain = await getTursoClientForTenant(0);
+      const rows = await dbMain.select().from(appSettings).where(eq(appSettings.tenantId, 0));
       const map = {};
-			for (const r of rows || []) map[r.key || r.KEY] = r.value || r.VALUE;
+      for (const r of rows || []) {
+        map[r.key] = r.value;
+      }
       if (!map['social_forum_mode']) map['social_forum_mode'] = 'shared';
       return c.json(map);
     }
-		const { rows } = await client.execute("select key, value, tenant_id from app_settings where tenant_id in (0)");
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const rows = await db.select().from(appSettings).where(inArray(appSettings.tenantId, [tenantId, 0]));
     const map = {};
-		for (const r of rows || []) map[r.key || r.KEY] = r.value || r.VALUE;
+    for (const r of rows || []) {
+      if (r.tenantId === 0 && map[r.key] !== undefined) continue;
+      map[r.key] = r.value;
+    }
     if (!map['social_forum_mode']) map['social_forum_mode'] = 'shared';
     return c.json(map);
   } catch (e) {
-		console.error('GET /settings error', e);
-    return c.json({ site_name: '大海团队', social_forum_mode: 'shared' });
+    console.error('GET /api/settings error', e);
+    return c.json({});
   }
 });
-app.get('/api/settings', async (c) => c.redirect('/settings'));
 
-// Default content fallbacks
-const defaultContent = {
-  home: {
-    carousel: [
-      { title: '欢迎来到大海团队', description: '探索我们的产品与社区', image_url: 'https://picsum.photos/1200/400?1', overlay_opacity: 30 },
-      { title: '最新活动', description: '关注最新动态与公告', image_url: 'https://picsum.photos/1200/400?2', overlay_opacity: 25 },
-    ],
-    announcements: [
-      { text: '🚀 网站全新上线，欢迎体验！' },
-      { text: '📢 加入社区，获取更多福利与资讯。' },
-    ],
-    feature_cards: [
-      { title: '朋友圈', description: '与好友互动交流', icon: 'MessageSquare', path: '/social' },
-      { title: '游戏中心', description: '发现有趣的小游戏', icon: 'Gamepad2', path: '/games' },
-      { title: '站点设置', description: '自定义你的网站', icon: 'Settings', path: '/admin/site-settings' },
-    ],
-    hot_games: [
-      { id: 1, title: '2048', description: '简单益智小游戏', info: '轻松上手', path: '/games/2048', isOfficial: true },
-      { id: 2, title: '贪吃蛇', description: '经典怀旧玩法', info: '适合放松', path: '/games/snake' },
-      { id: 3, title: '扫雷', description: '挑战你的反应', info: '烧脑益智', path: '/games/minesweeper' },
-    ],
-    pinned_ads: [
-      { title: '加入VIP会员', description: '解锁更多专属权益', link_url: '#', background_image_url: 'https://picsum.photos/1200/400?ad' }
-    ]
-  },
-  games: {
-    game_categories: [
-      { slug: 'all', name: '全部', icon: 'AppWindow' },
-      { slug: 'puzzle', name: '益智', icon: 'Brain' },
-      { slug: 'classic', name: '经典', icon: 'Gamepad2' },
-    ],
-    game_cards: [
-      { id: 1, category_slug: 'puzzle', title: '2048', description: '简单益智小游戏', info: '轻松上手', path: '/games/2048', isOfficial: true },
-      { id: 2, category_slug: 'classic', title: '贪吃蛇', description: '经典怀旧玩法', info: '适合放松', path: '/games/snake' },
-      { id: 3, category_slug: 'classic', title: '扫雷', description: '挑战你的反应', info: '烧脑益智', path: '/games/minesweeper' },
-    ]
-  }
-};
-
-// Page content
-app.get('/page-content', async (c) => {
+app.get('/api/page-content', async (c) => {
+  __setCache(c, 60);
   try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
     const page = c.req.query('page');
     const section = c.req.query('section');
     if (!page || !section) return c.json([]);
-		const client = getPrimary();
-		const { rows } = await client.execute({
-			sql: "select id, tenant_id, position, content from page_content where page = ? and section = ? and tenant_id in (0) order by position",
-			args: [page, section]
-		});
-		const list = (rows || []).map((r) => {
-			let contentObj = {};
-			try {
-				contentObj = typeof r.content === 'string' ? JSON.parse(r.content) : (r.content || {});
-    } catch {}
-			return { id: r.id || r.ID, position: r.position || r.POSITION, ...contentObj };
-		});
-    if (list.length === 0 && defaultContent[page] && defaultContent[page][section]) {
-      return c.json(defaultContent[page][section]);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    // detect globalOnly
+    const pageDef = pageConfig?.[page];
+    const secDef = pageDef?.sections?.find(s => s.id === section);
+    const forceGlobal = !!secDef?.globalOnly;
+
+    if (forceGlobal) {
+      const rows = await defaultDb
+        .select()
+        .from(pageContentTable)
+        .where(and(eq(pageContentTable.page, page), eq(pageContentTable.section, section), eq(pageContentTable.tenantId, 0)))
+        .orderBy(pageContentTable.position);
+      const list = (rows || []).map((r) => ({
+        id: r.id,
+        position: r.position,
+        ...(typeof r.content === 'string' ? JSON.parse(r.content || '{}') : r.content),
+      }));
+      return c.json(list);
     }
+
+    // 非全局：并行查询 分站 + 主站，然后以分站优先
+    const dbTenant = await getTursoClientForTenant(tenantId);
+    const [rowsTenant, rowsMain] = await Promise.all([
+      dbTenant
+        .select()
+        .from(pageContentTable)
+        .where(and(eq(pageContentTable.page, page), eq(pageContentTable.section, section), eq(pageContentTable.tenantId, tenantId)))
+        .orderBy(pageContentTable.position),
+      defaultDb
+        .select()
+        .from(pageContentTable)
+        .where(and(eq(pageContentTable.page, page), eq(pageContentTable.section, section), eq(pageContentTable.tenantId, 0)))
+        .orderBy(pageContentTable.position),
+    ]);
+
+    const useRows = (rowsTenant && rowsTenant.length > 0) ? rowsTenant : (rowsMain || []);
+    const list = (useRows || []).map((r) => ({
+      id: r.id,
+      position: r.position,
+      ...(typeof r.content === 'string' ? JSON.parse(r.content || '{}') : r.content),
+    }));
     return c.json(list);
   } catch (e) {
-		console.error('GET /page-content error', e);
-    const page = c.req.query('page');
-    const section = c.req.query('section');
-    if (defaultContent[page] && defaultContent[page][section]) {
-      return c.json(defaultContent[page][section]);
-    }
+    console.error('GET /api/page-content error', e);
     return c.json([]);
   }
 });
-app.get('/api/page-content', async (c) => c.redirect('/page-content'));
-
-// Tenant resolve
-app.get('/tenant/resolve', async (c) => {
-	try {
-		const hostname = c.req.query('host') || '';
-		const client = getPrimary();
-		const { rows } = await client.execute({
-			sql: "select id from tenant_requests where desired_domain = ? limit 1",
-			args: [hostname]
-		});
-		const id = rows && rows[0] ? (rows[0].id || rows[0].ID) : 0;
-		return c.json({ tenantId: id || 0 });
-  } catch (e) {
-		return c.json({ tenantId: 0 });
-	}
-});
-app.get('/api/tenant/resolve', async (c) => c.redirect('/tenant/resolve'));
-
-// Social feed posts (placeholder)
-const demoAuthors = [
-  { id: 'u1', username: '小海', avatar_url: '/avatar-fallback.png' },
-  { id: 'u2', username: '小贝', avatar_url: '/avatar-fallback.png' }
-];
-const demoPosts = Array.from({ length: 30 }).map((_, i) => ({
-  id: i + 1,
-  tenant_id: 0,
-  author: demoAuthors[i % demoAuthors.length],
-  content: `示例动态 ${i + 1}: 欢迎体验大海团队站点！`,
-  image_urls: (i % 3 === 0) ? [
-    `https://picsum.photos/seed/${i}-1/400/300`,
-    `https://picsum.photos/seed/${i}-2/400/300`
-  ] : [],
-  is_ad: false,
-  status: 'approved',
-  likes: [],
-  likes_count: Math.floor(Math.random() * 50),
-  comments: []
-}));
 
 app.get('/api/posts', async (c) => {
-  const page = Number(c.req.query('page') || '1');
-  const pageSize = Number(c.req.query('pageSize') || '20');
-  const start = (page - 1) * pageSize;
-  const end = start + pageSize;
-  const items = demoPosts.slice(start, end);
-  const hasMore = end < demoPosts.length;
-  return c.json({ items, page, pageSize, hasMore });
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tab = c.req.query('tab') || 'social';
+    const page = Number(c.req.query('page') || 0);
+    const pageSize = Math.min(Number(c.req.query('size') || 20), 50);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const isAd = tab === 'ads' ? 1 : 0;
+    let rows = await db
+      .select()
+      .from(postsTable)
+      .where(and(eq(postsTable.status, 'approved'), eq(postsTable.isAd, isAd), inArray(postsTable.tenantId, [tenantId, 0])))
+      .orderBy(desc(postsTable.isPinned), desc(postsTable.createdAt))
+      .limit(pageSize)
+      .offset(page * pageSize);
+
+    // Auto seed demo content in dev when empty (only for social tab and first page)
+    if ((rows || []).length === 0 && page === 0 && isAd === 0 && process.env.NODE_ENV !== 'production') {
+      const nowIso = new Date().toISOString();
+      const demoAuthors = [
+        { id: 'demo-user-1', username: '小海', avatarUrl: null },
+        { id: 'demo-user-2', username: '贝壳', avatarUrl: null },
+      ];
+      for (const a of demoAuthors) {
+        const exists = await db.select().from(profiles).where(eq(profiles.id, a.id)).limit(1);
+        if (!exists || exists.length === 0) {
+          await db.insert(profiles).values({ id: a.id, username: a.username, avatarUrl: a.avatarUrl, tenantId: tenantId, points: 0, createdAt: nowIso });
+        }
+      }
+      const samples = [
+        { authorId: 'demo-user-1', content: '欢迎来到社区！这是演示动态。', images: JSON.stringify([]), isPinned: 1 },
+        { authorId: 'demo-user-2', content: '你可以在这里发布图文，互动评论～', images: JSON.stringify(['https://picsum.photos/seed/demo2/600/400']), isPinned: 0 },
+        { authorId: 'demo-user-1', content: '试着点赞或发表评论看看效果。', images: JSON.stringify([]), isPinned: 0 },
+      ];
+      for (const s of samples) {
+        await db.insert(postsTable).values({
+          tenantId,
+          authorId: s.authorId,
+          content: s.content,
+          images: s.images,
+          isAd: 0,
+          isPinned: s.isPinned,
+          status: 'approved',
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+      }
+      rows = await db
+        .select()
+        .from(postsTable)
+        .where(and(eq(postsTable.status, 'approved'), eq(postsTable.isAd, isAd), inArray(postsTable.tenantId, [tenantId, 0])))
+        .orderBy(desc(postsTable.isPinned), desc(postsTable.createdAt))
+        .limit(pageSize)
+        .offset(page * pageSize);
+    }
+
+    const postIds = (rows || []).map((r) => r.id);
+    const authorIds = Array.from(new Set((rows || []).map((r) => r.authorId).filter(Boolean)));
+
+    // batch authors
+    let authors = [];
+    if (authorIds.length > 0) {
+      authors = await db.select().from(profiles).where(inArray(profiles.id, authorIds));
+    }
+    const authorMap = new Map();
+    for (const a of authors || []) {
+      authorMap.set(a.id, { id: a.id, username: a.username, avatar_url: a.avatarUrl });
+    }
+
+    // batch likes/comments count via grouped queries
+    const likesCountMap = new Map();
+    const commentsCountMap = new Map();
+    if (postIds.length > 0) {
+      try {
+        const raw = await getLibsqlClientForTenantRaw(tenantId);
+        const placeholders = postIds.map(() => '?').join(',');
+        const likeRows = await raw.execute({ sql: `select post_id as pid, count(1) as c from likes where post_id in (${placeholders}) group by post_id`, args: postIds });
+        for (const r of likeRows?.rows || []) {
+          const pid = r.pid ?? r[0];
+          const c = Number(r.c ?? r[1] ?? 0);
+          if (pid != null) likesCountMap.set(Number(pid), c);
+        }
+        const cmRows = await raw.execute({ sql: `select post_id as pid, count(1) as c from comments where post_id in (${placeholders}) group by post_id`, args: postIds });
+        for (const r of cmRows?.rows || []) {
+          const pid = r.pid ?? r[0];
+          const c = Number(r.c ?? r[1] ?? 0);
+          if (pid != null) commentsCountMap.set(Number(pid), c);
+      }
+      } catch {}
+    }
+
+    // likedByMe
+    let likedSet = new Set();
+    const userId = c.get('userId');
+    if (userId && postIds.length > 0) {
+      const likedRows = await db.select({ pid: likesTable.postId }).from(likesTable).where(and(eq(likesTable.userId, userId), inArray(likesTable.postId, postIds)));
+      likedSet = new Set((likedRows || []).map(r => r.pid));
+    }
+
+    const enriched = (rows || []).map((r) => ({
+      ...r,
+      author: authorMap.get(r.authorId) || null,
+      likesCount: likesCountMap.get(r.id) || 0,
+      commentsCount: commentsCountMap.get(r.id) || 0,
+      likedByMe: userId ? likedSet.has(r.id) : false,
+    }));
+
+    return c.json(enriched);
+  } catch (e) {
+    console.error('GET /api/posts error', e);
+    return c.json([]);
+  }
 });
+
+app.get('/api/comments', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const postId = Number(c.req.query('postId'));
+    if (!postId) return c.json([]);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const rows = await db
+      .select()
+      .from(commentsTable)
+      .where(eq(commentsTable.postId, postId))
+      .orderBy(desc(commentsTable.createdAt));
+    const profileMap = new Map();
+    const uids = Array.from(new Set((rows || []).map(r => r.userId).filter(Boolean)));
+    if (uids.length > 0) {
+      const authors = await db.select().from(profiles).where(inArray(profiles.id, uids));
+      for (const a of authors || []) profileMap.set(a.id, a);
+    }
+    const result = (rows || []).map((cm) => ({
+      ...cm,
+      author: profileMap.get(cm.userId) ? { id: profileMap.get(cm.userId).id, username: profileMap.get(cm.userId).username, avatar_url: profileMap.get(cm.userId).avatarUrl } : null,
+    }));
+    return c.json(result);
+  } catch (e) {
+    console.error('GET /api/comments error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/comments', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const body = await c.req.json();
+    const { postId, content } = body || {};
+    if (!postId || !content) return c.json({ error: 'invalid' }, 400);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const now = new Date().toISOString();
+    // deduct comment cost from global profile
+    try {
+      const map = await readSettingsMap();
+      const cost = toInt(map['comment_cost'], 1);
+      const pdb = await getTursoClientForTenant(0);
+      const prof = (await pdb.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+      if ((prof?.points || 0) < cost) return c.json({ error: 'insufficient-points' }, 400);
+      await pdb.update(profiles).set({ points: (prof?.points || 0) - cost }).where(eq(profiles.id, userId));
+      await pdb.insert(pointsHistoryTable).values({ userId, changeAmount: -cost, reason: '发表评论', createdAt: now });
+    } catch {}
+    await db.insert(commentsTable).values({ postId, userId, content, createdAt: now });
+    const author = await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    const created = { id: undefined, postId, userId, content, createdAt: now, author: author?.[0] ? { id: author[0].id, username: author[0].username, avatar_url: author[0].avatarUrl } : null };
+    return c.json(created);
+  } catch (e) {
+    console.error('POST /api/comments error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.delete('/api/comments/:id', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({});
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.delete(commentsTable).where(and(eq(commentsTable.id, id), eq(commentsTable.userId, userId)));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/comments/:id error', e);
+    return c.json({ ok: false });
+  }
+});
+
+app.post('/api/likes', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { postId } = await c.req.json();
+    if (!postId) return c.json({ error: 'invalid' }, 400);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    await ensureTenantForumSchemaRaw(tenantId);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.insert(likesTable).values({ postId, userId });
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/likes error', e);
+    return c.json({ ok: false });
+  }
+});
+
+app.delete('/api/likes', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { postId } = await c.req.json();
+    if (!postId) return c.json({ error: 'invalid' }, 400);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    await ensureTenantForumSchemaRaw(tenantId);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.delete(likesTable).where(and(eq(likesTable.postId, postId), eq(likesTable.userId, userId)));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/likes error', e);
+    return c.json({ ok: false });
+  }
+});
+
+app.delete('/api/posts/:id', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const rows = await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1);
+    const post = rows?.[0];
+    if (!post) return c.json({ error: 'not-found' }, 404);
+    const isSuper = await isSuperAdminUser(userId);
+    if (!isSuper && post.authorId !== userId) return c.json({ error: 'forbidden' }, 403);
+    await db.delete(postsTable).where(eq(postsTable.id, id));
+    await db.delete(commentsTable).where(eq(commentsTable.postId, id));
+    await db.delete(likesTable).where(eq(likesTable.postId, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/posts/:id error', e);
+    return c.json({ ok: false });
+  }
+});
+
+app.post('/api/posts/:id/pin', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const { pinned } = await c.req.json();
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    // permission: only super admin can pin in tenant-specific mode
+    const isSuper = await isSuperAdminUser(userId);
+    if (!isSuper) return c.json({ error: 'forbidden' }, 403);
+    await db.update(postsTable).set({ isPinned: pinned ? 1 : 0 }).where(eq(postsTable.id, id));
+    const rows = await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1);
+    return c.json(rows?.[0] || { id, is_pinned: pinned ? 1 : 0 });
+  } catch (e) {
+    console.error('POST /api/posts/:id/pin error', e);
+    return c.json({ ok: false });
+  }
+});
+
+app.get('/api/notifications/unread', async (c) => {
+  try {
+    const db = await getTursoClientForTenant(0);
+    const userId = c.get('userId');
+    if (!userId) return c.json({ items: [], count: 0 });
+    const items = await db
+      .select()
+      .from(notificationsTable)
+      .where(and(eq(notificationsTable.userId, userId), eq(notificationsTable.isRead, 0)))
+      .orderBy(desc(notificationsTable.createdAt))
+      .limit(5);
+    const mapped = (items || []).map(r => {
+      let parsed;
+      try { parsed = typeof r.content === 'string' ? JSON.parse(r.content) : (r.content || {}); } catch { parsed = { message: String(r.content || '') }; }
+      const typeVal = r.type || (parsed && parsed.type) || 'system';
+      return {
+        id: r.id,
+        user_id: r.userId,
+        is_read: r.isRead ? 1 : 0,
+        created_at: r.createdAt,
+        type: typeVal,
+        related_post_id: r.relatedPostId || null,
+        content: parsed,
+      };
+    });
+    const count = mapped.length || 0;
+    return c.json({ items: mapped, count });
+  } catch (e) {
+    console.error('GET /api/notifications/unread error', e);
+    return c.json({ items: [], count: 0 });
+  }
+});
+
+app.get('/api/stats', async (c) => {
+  __setCache(c, 30);
+  try {
+    const db = await getTursoClientForTenant(0);
+    const usersCnt = await db.select({ c: sql`count(1)` }).from(profiles);
+    const postsCnt = await db.select({ c: sql`count(1)` }).from(postsTable);
+    const totalUsers = Number(usersCnt?.[0]?.c || 0);
+    const totalPosts = Number(postsCnt?.[0]?.c || 0);
+
+    const days = 30;
+    const since = new Date(Date.now() - (days - 1) * 24 * 3600 * 1000);
+    const startDay = since.toISOString().slice(0, 10);
+
+    const client = getGlobalClient();
+    const usersAgg = await client.execute({ sql: "select substr(created_at,1,10) as d, count(1) as c from profiles where created_at >= ? group by substr(created_at,1,10)", args: [startDay] });
+    const postsAgg = await client.execute({ sql: "select substr(created_at,1,10) as d, count(1) as c from posts where created_at >= ? group by substr(created_at,1,10)", args: [startDay] });
+
+    const dailyData = {};
+    for (let i = 0; i < days; i++) {
+      const d = new Date(since.getTime() + i * 24 * 3600 * 1000).toISOString().slice(0, 10);
+      dailyData[d] = { users: 0, posts: 0 };
+    }
+    for (const r of usersAgg?.rows || []) {
+      const d = r.d || r[0];
+      const cval = Number(r.c || r[1] || 0);
+      if (dailyData[d]) dailyData[d].users = cval;
+    }
+    for (const r of postsAgg?.rows || []) {
+      const d = r.d || r[0];
+      const cval = Number(r.c || r[1] || 0);
+      if (dailyData[d]) dailyData[d].posts = cval;
+    }
+
+    return c.json({ totalUsers, totalPosts, dailyData });
+  } catch (e) {
+    console.error('GET /api/stats error', e);
+    return c.json({ totalUsers: 0, totalPosts: 0, dailyData: {} });
+  }
+});
+
+app.get('/api/plausible/stats', async (c) => {
+  try {
+    const period = c.req.query('period') || '30d';
+    const days = period === 'today' ? 1 : period === '7d' ? 7 : 30;
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const data = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(start.getTime() - i * 24 * 3600 * 1000);
+      const visitors = Math.floor(80 + Math.random() * 220);
+      const pageviews = Math.floor(visitors * (1.2 + Math.random() * 1.8));
+      const bounce_rate = Math.round((40 + Math.random() * 30));
+      data.push({
+        date: d.toISOString().slice(0, 10),
+        visitors,
+        pageviews,
+        bounce_rate,
+      });
+    }
+    return c.json(data);
+  } catch (e) {
+    console.error('GET /api/plausible/stats error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/users', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json([], 403);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column uid text"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("create unique index if not exists idx_profiles_uid on profiles(uid)"); } catch {}
+    let rows = await db.select().from(profiles);
+    // backfill uid if missing
+    for (const r of rows || []) {
+      if (!r.uid) {
+        try { await ensureUid(db, profiles, profiles.id, r.id); } catch {}
+      }
+    }
+    rows = await db.select().from(profiles);
+    // role sets
+    const gdb = getGlobalDb();
+    try { await ensureTenantRequestsSchemaRaw(getGlobalClient()); } catch {}
+    const superRows = await gdb.select().from(adminUsersTable);
+    const superSet = new Set((superRows || []).map(r => r.userId));
+    const allTenantAdminRows = await gdb.select().from(tenantAdminsTable);
+    const tenantAdminSet = new Set((allTenantAdminRows || []).filter(r => Number(r.tenantId) === Number(tenantId)).map(r => r.userId));
+    // per-user tenant admin membership
+    const adminTenantsByUser = new Map();
+    for (const r of (allTenantAdminRows || [])) {
+      const arr = adminTenantsByUser.get(r.userId) || [];
+      const tId = Number(r.tenantId);
+      if (!arr.includes(tId)) arr.push(tId);
+      adminTenantsByUser.set(r.userId, arr);
+    }
+    // map tenant id -> domain
+    let tenantRowsAll = [];
+    try { tenantRowsAll = await gdb.select().from(tenantRequestsTable); } catch {}
+    const idToDomain = new Map((tenantRowsAll || []).map(tr => [Number(tr.id), tr.desiredDomain || tr.desired_domain || '']));
+    // map snake_case and role
+    const list = (rows || []).map(r => {
+      const tenantIds = adminTenantsByUser.get(r.id) || [];
+      const domains = tenantIds.map(id => idToDomain.get(Number(id))).filter(Boolean);
+      return {
+        ...r,
+        avatar_url: r.avatarUrl,
+        tenant_id: r.tenantId,
+        virtual_currency: r.virtualCurrency,
+        invitation_points: r.invitationPoints,
+        free_posts_count: r.freePostsCount,
+        created_at: r.createdAt,
+        is_super_admin: superSet.has(r.id),
+        is_tenant_admin: tenantAdminSet.has(r.id),
+        tenant_admin_tenants: tenantIds,
+        tenant_admin_domains: domains,
+        role: superSet.has(r.id) ? 'super-admin' : (tenantAdminSet.has(r.id) ? 'tenant-admin' : 'user'),
+      };
+    });
+    return c.json(list || []);
+  } catch (e) {
+    console.error('GET /api/admin/users error', e);
+    return c.json([]);
+  }
+});
+
+// Manage user roles (super-admin / tenant-admin)
+app.post('/api/admin/users/:id/role', async (c) => {
+  try {
+    const actorId = c.get('userId'); if (!actorId) return c.json({ error: 'unauthorized' }, 401);
+    const isActorSuper = await isSuperAdminUser(actorId);
+    if (!isActorSuper) return c.json({ error: 'forbidden' }, 403);
+    const targetId = c.req.param('id'); if (!targetId) return c.json({ error: 'invalid' }, 400);
+    const body = await c.req.json();
+    const action = body?.action;
+    const explicitTenantId = Number(body?.tenantId || 0);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const tenantId = explicitTenantId > 0 ? explicitTenantId : resolvedTenantId;
+    const gdb = getGlobalDb();
+
+    if (action === 'set-super' || action === 'remove-super') {
+      // already ensured actor is super
+    }
+
+    if (action === 'set-super') {
+      await gdb.insert(adminUsersTable).values({ userId: targetId });
+    } else if (action === 'remove-super') {
+      await gdb.delete(adminUsersTable).where(eq(adminUsersTable.userId, targetId));
+    } else if (action === 'set-tenant-admin') {
+      // Prevent duplicates and enforce single-tenant-only per user
+      try {
+        const existing = await gdb.select().from(tenantAdminsTable).where(eq(tenantAdminsTable.userId, targetId));
+        const hasSame = (existing || []).some(r => Number(r.tenantId) === Number(tenantId));
+        if (hasSame) return c.json({ error: 'already-tenant-admin' }, 409);
+        if ((existing || []).length > 0) return c.json({ error: 'single-tenant-only' }, 409);
+      } catch {}
+      await gdb.insert(tenantAdminsTable).values({ tenantId, userId: targetId });
+    } else if (action === 'remove-tenant-admin') {
+      await gdb.delete(tenantAdminsTable).where(and(eq(tenantAdminsTable.tenantId, tenantId), eq(tenantAdminsTable.userId, targetId)));
+    } else {
+      return c.json({ error: 'invalid-action' }, 400);
+    }
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/users/:id/role error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.get('/api/admin/posts', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const status = c.req.query('status'); // optional
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    let rows = await db
+      .select()
+      .from(postsTable)
+      .where(inArray(postsTable.tenantId, [tenantId, 0]))
+      .orderBy(desc(postsTable.createdAt));
+    if (status) {
+      rows = (rows || []).filter((r) => r.status === status);
+    }
+    const authorIds = Array.from(new Set((rows || []).map((r) => r.authorId).filter(Boolean)));
+    let authors = [];
+    if (authorIds.length > 0) {
+      authors = await db.select().from(profiles).where(inArray(profiles.id, authorIds));
+    }
+    const authorMap = new Map();
+    for (const a of authors || []) authorMap.set(a.id, { id: a.id, username: a.username, avatar_url: a.avatarUrl });
+    const enriched = (rows || []).map((r) => ({ ...r, author: authorMap.get(r.authorId) || null }));
+    return c.json(enriched);
+  } catch (e) {
+    console.error('GET /api/admin/posts error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/comments', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const rows = await db.select().from(commentsTable).orderBy(desc(commentsTable.createdAt));
+    const userIds = Array.from(new Set((rows || []).map((r) => r.userId)));
+    const postIds = Array.from(new Set((rows || []).map((r) => r.postId)));
+    let authors = [];
+    if (userIds.length > 0) authors = await db.select().from(profiles).where(inArray(profiles.id, userIds));
+    let posts = [];
+    if (postIds.length > 0) posts = await db.select().from(postsTable).where(inArray(postsTable.id, postIds));
+    const authorMap = new Map();
+    for (const a of authors || []) authorMap.set(a.id, { id: a.id, username: a.username, avatar_url: a.avatarUrl });
+    const postMap = new Map();
+    for (const p of posts || []) postMap.set(p.id, { id: p.id, content: p.content });
+    const enriched = (rows || []).map((r) => ({
+      ...r,
+      author: authorMap.get(r.userId) || null,
+      post: postMap.get(r.postId) || null,
+    }));
+    return c.json(enriched);
+  } catch (e) {
+    console.error('GET /api/admin/comments error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/admin/posts/:id/status', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const { status, reason } = await c.req.json();
+    if (!id || !status) return c.json({ error: 'invalid' }, 400);
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.update(postsTable).set({ status, rejectionReason: reason ?? null }).where(eq(postsTable.id, id));
+    const rows = await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1);
+    return c.json(rows?.[0] || { id, status, rejection_reason: reason ?? null });
+  } catch (e) {
+    console.error('POST /api/admin/posts/:id/status error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/admin/seed-demo', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+
+    // Ensure a demo user exists
+    const existingUser = await defaultDb.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    if (!existingUser || existingUser.length === 0) {
+      await defaultDb.insert(profiles).values({ id: userId, username: '演示用户', tenantId: 0, points: 100, createdAt: new Date().toISOString() });
+    }
+
+    // Insert a few demo posts if none
+    const existingPosts = await defaultDb.select().from(postsTable).limit(1);
+    if (!existingPosts || existingPosts.length === 0) {
+      const now = Date.now();
+      const sample = [
+        { content: '欢迎来到大海团队的社区！', images: JSON.stringify([]) },
+        { content: '这是第二条演示动态，支持图片与评论～', images: JSON.stringify(['https://picsum.photos/seed/demo1/600/400']) },
+        { content: '把你的第一条动态发出来吧！', images: JSON.stringify([]) },
+      ];
+      for (let i = 0; i < sample.length; i++) {
+        const createdAt = new Date(now - (sample.length - 1 - i) * 3600 * 1000).toISOString();
+        await defaultDb.insert(postsTable).values({
+          tenantId: 0,
+          authorId: userId,
+          content: sample[i].content,
+          images: sample[i].images,
+          isAd: 0,
+          isPinned: i === 0 ? 1 : 0,
+          status: 'approved',
+          createdAt,
+          updatedAt: createdAt,
+        });
+      }
+    }
+
+    // Add a couple comments and likes to the most recent post
+    const posts = await defaultDb.select().from(postsTable).orderBy(desc(postsTable.createdAt)).limit(1);
+    const latest = posts?.[0];
+    if (latest) {
+      await defaultDb.insert(commentsTable).values({ postId: latest.id, userId, content: '第一！', createdAt: new Date().toISOString() });
+      await defaultDb.insert(likesTable).values({ postId: latest.id, userId });
+    }
+
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/seed-demo error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/seed-homepage', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const now = new Date().toISOString();
+
+    const existing = await db.select().from(pageContentTable).where(and(eq(pageContentTable.page, 'home'), inArray(pageContentTable.section, ['carousel','announcements','feature_cards','hot_games'])));
+    if ((existing || []).length > 0) return c.json({ ok: true, skipped: true });
+
+    const inserts = [
+      { tenantId, page: 'home', section: 'carousel', position: 0, content: JSON.stringify({ title: '欢迎来到大海团队', description: '体验社交与游戏的乐趣', image_url: 'https://picsum.photos/seed/carousel/1200/400' }) },
+      { tenantId, page: 'home', section: 'announcements', position: 0, content: JSON.stringify({ text: '🎉 平台全新上线，欢迎体验！' }) },
+      { tenantId, page: 'home', section: 'feature_cards', position: 0, content: JSON.stringify({ title: '朋友圈', description: '分享日常，互动点赞', path: '/social', icon: 'MessageSquare' }) },
+      { tenantId, page: 'home', section: 'feature_cards', position: 1, content: JSON.stringify({ title: '游戏中心', description: '精选小游戏合集', path: '/games', icon: 'Gamepad2' }) },
+      { tenantId, page: 'home', section: 'feature_cards', position: 2, content: JSON.stringify({ title: '站点设置', description: '自定义站点内容', path: '/admin/page-content', icon: 'Settings' }) },
+      { tenantId, page: 'home', section: 'hot_games', position: 0, content: JSON.stringify({ title: '演示游戏A', description: '有趣又好玩', path: '/games', iconUrl: 'https://picsum.photos/seed/game1/200/200' }) },
+      { tenantId, page: 'home', section: 'hot_games', position: 1, content: JSON.stringify({ title: '演示游戏B', description: '简单轻松', path: '/games', iconUrl: 'https://picsum.photos/seed/game2/200/200' }) },
+    ];
+    for (const v of inserts) {
+      await db.insert(pageContentTable).values(v);
+    }
+
+    return c.json({ ok: true, count: inserts.length, tenantId });
+  } catch (e) {
+    console.error('POST /api/admin/seed-homepage error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/seed-tenant', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const tenantIdParam = c.req.query('tenantId');
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenant = await resolveTenantId(defaultDb, host);
+    const tenantId = tenantIdParam !== undefined ? Number(tenantIdParam) : resolvedTenant;
+    const db = await getTursoClientForTenant(tenantId);
+
+    // profiles
+    const authors = [
+      { id: 'tenant-user-1', username: '演示用户1' },
+      { id: 'tenant-user-2', username: '演示用户2' },
+    ];
+    for (const a of authors) {
+      const exist = await db.select().from(profiles).where(eq(profiles.id, a.id)).limit(1);
+      if (!exist || exist.length === 0) {
+        await db.insert(profiles).values({ id: a.id, username: a.username, tenantId, points: 0, createdAt: new Date().toISOString() });
+      }
+    }
+
+    // posts
+    const existingPosts = await db.select().from(postsTable).limit(1);
+    if (!existingPosts || existingPosts.length === 0) {
+      const now = Date.now();
+      const samples = [
+        { authorId: authors[0].id, content: '欢迎来到分站，这里是演示内容。', images: JSON.stringify([]), isPinned: 1 },
+        { authorId: authors[1].id, content: '可以在这里发布动态和图片。', images: JSON.stringify(['https://picsum.photos/seed/tpost/600/400']), isPinned: 0 },
+      ];
+      for (let i = 0; i < samples.length; i++) {
+        const createdAt = new Date(now - (samples.length - 1 - i) * 3600 * 1000).toISOString();
+        await db.insert(postsTable).values({ tenantId, authorId: samples[i].authorId, content: samples[i].content, images: samples[i].images, isAd: 0, isPinned: samples[i].isPinned, status: 'approved', createdAt, updatedAt: createdAt });
+      }
+    }
+
+    // homepage content via existing seeder
+    const seedRes = await fetch('http://localhost:8787/api/admin/seed-homepage', { method: 'POST', headers: { Authorization: c.req.header('authorization') || '' } });
+    await seedRes.text().catch(() => {});
+
+    return c.json({ ok: true, tenantId });
+  } catch (e) {
+    console.error('POST /api/admin/seed-tenant error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/seed-shared', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    // ensure app_settings
+    await db.insert(appSettings).values({ tenantId: 0, key: 'social_forum_mode', value: 'shared' }).onConflictDoNothing?.();
+
+    // ensure author profile
+    const now = new Date().toISOString();
+    const prof = await db.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1);
+    if (!prof || prof.length === 0) await db.insert(sharedProfiles).values({ id: userId, username: '平台用户', createdAt: now });
+
+    const exist = await db.select().from(sharedPosts).limit(1);
+    if (!exist || exist.length === 0) {
+      await db.insert(sharedPosts).values({ authorId: userId, content: '欢迎来到共享论坛！', images: JSON.stringify([]), isPinned: 1, status: 'approved', createdAt: now, updatedAt: now });
+      await db.insert(sharedPosts).values({ authorId: userId, content: '这是第二条演示动态。', images: JSON.stringify([]), isPinned: 0, status: 'approved', createdAt: now, updatedAt: now });
+    }
+
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/seed-shared error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/auth/is-super-admin', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ isSuperAdmin: false });
+    const db = getGlobalDb();
+    const rows = await db.select().from(adminUsersTable).where(eq(adminUsersTable.userId, userId)).limit(1);
+    return c.json({ isSuperAdmin: (rows || []).length > 0 });
+  } catch (e) {
+    console.error('GET /api/auth/is-super-admin error', e);
+    return c.json({ isSuperAdmin: false });
+  }
+});
+
+app.get('/api/auth/tenant-admins', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json([]);
+    const db = getGlobalDb();
+    const rows = await db.select().from(tenantAdminsTable).where(eq(tenantAdminsTable.userId, userId));
+    return c.json(rows || []);
+  } catch (e) {
+    console.error('GET /api/auth/tenant-admins error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/branch-map', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const envMap = (() => { try { return process.env.TURSO_BRANCH_MAP ? JSON.parse(process.env.TURSO_BRANCH_MAP) : {}; } catch { return {}; } })();
+    return c.json({ runtime: runtimeBranchMap, env: envMap });
+  } catch (e) {
+    return c.json({ runtime: runtimeBranchMap, env: {} });
+  }
+});
+
+app.post('/api/admin/branch-map', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const { tenantId, branchUrl } = await c.req.json();
+    if (tenantId === undefined || !branchUrl) return c.json({ error: 'invalid' }, 400);
+    runtimeBranchMap[String(tenantId)] = branchUrl;
+    return c.json({ ok: true, runtime: runtimeBranchMap });
+  } catch (e) {
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.delete('/api/admin/branch-map/:tenantId', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const t = c.req.param('tenantId');
+    delete runtimeBranchMap[String(t)];
+    return c.json({ ok: true, runtime: runtimeBranchMap });
+  } catch (e) {
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+function requireAdmin(c) {
+  const userId = c.get('userId');
+  if (!userId) return { ok: false, reason: 'unauthorized' };
+  return { ok: true, userId };
+}
+
+async function isSuperAdminUser(userId) {
+  if (!userId) return false;
+  try {
+    const db = getGlobalDb();
+    const rows = await db.select().from(adminUsersTable).where(eq(adminUsersTable.userId, userId)).limit(1);
+    return (rows || []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function canManageTenant(userId, tenantId) {
+  if (!userId) return false;
+  if (await isSuperAdminUser(userId)) return true;
+  try {
+    const gdb = getGlobalDb();
+    const rows = await gdb.select().from(tenantAdminsTable).where(and(eq(tenantAdminsTable.userId, userId), eq(tenantAdminsTable.tenantId, tenantId))).limit(1);
+    return (rows || []).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureUid(db, table, idField, idValue) {
+  // Try read uid; if schema lacks uid, silently skip
+  try {
+    const profile = await db.select().from(table).where(eq(idField, idValue)).limit(1);
+    if (profile && profile[0] && profile[0].uid) return profile[0].uid;
+  } catch {}
+  // Generate unique 6-digit uid
+  const rnd = () => String(Math.floor(100000 + Math.random() * 900000));
+  let uid = rnd();
+  let tries = 0;
+  try {
+    while (tries < 10) {
+      const exists = await db.select().from(table).where(eq(table.uid, uid)).limit(1);
+      if (!exists || exists.length === 0) break;
+      uid = rnd();
+      tries++;
+    }
+    await db.update(table).set({ uid }).where(eq(idField, idValue));
+  } catch {}
+  return uid;
+}
+
+function generateInviteCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+async function ensureInviteCode(db, table, idField, idValue) {
+  // try read field
+  try {
+    const prof = await db.select().from(table).where(eq(idField, idValue)).limit(1);
+    const existing = prof?.[0]?.inviteCode;
+    const valid = typeof existing === 'string' && /^[A-Z0-9]{8}$/.test(existing);
+    if (valid) return existing;
+  } catch {}
+  // add column if missing
+  try { const raw = getGlobalClient(); await raw.execute("alter table profiles add column invite_code text"); } catch {}
+  // generate unique
+  let code = generateInviteCode();
+  try {
+    const raw = getGlobalClient();
+    // avoid collision up to 10 tries
+    for (let i = 0; i < 10; i++) {
+      const check = await raw.execute({ sql: "select 1 from profiles where invite_code = ? limit 1", args: [code] });
+      const exists = Array.isArray(check?.rows) && check.rows.length > 0;
+      if (!exists) break;
+      code = generateInviteCode();
+    }
+    await raw.execute({ sql: "update profiles set invite_code = ? where id = ?", args: [code, idValue] });
+  } catch {}
+  return code;
+}
+
+// Tenant requests admin routes
+app.get('/api/admin/tenant-requests', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json([], 401);
+    const gdb = getGlobalDb();
+    await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    const rows = await gdb.select().from(tenantRequestsTable).orderBy(desc(tenantRequestsTable.id));
+    // enrich profile from shared_profiles or profiles(0)
+    const ids = Array.from(new Set((rows || []).map(r => r.userId).filter(Boolean)));
+    const profs = ids.length ? await gdb.select().from(profiles).where(inArray(profiles.id, ids)) : [];
+    const pmap = new Map((profs || []).map(p => [p.id, { username: p.username, avatar_url: p.avatarUrl }]));
+    const list = (rows || []).map(r => ({
+      ...r,
+      profile: pmap.get(r.userId) || null,
+    }));
+    return c.json(list);
+  } catch (e) {
+    console.error('GET /api/admin/tenant-requests error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/tenant-requests/check-domain', async (c) => {
+  try {
+    const domain = c.req.query('domain');
+    if (!domain) return c.json({ available: false }, 400);
+    const gdb = getGlobalDb();
+    await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    const rows = await gdb.select().from(tenantRequestsTable).where(eq(tenantRequestsTable.desiredDomain, domain)).limit(1);
+    return c.json({ available: !(rows && rows.length) });
+  } catch (e) {
+    return c.json({ available: false });
+  }
+});
+
+app.post('/api/admin/tenant-requests', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const body = await c.req.json();
+    const desiredDomain = body?.desiredDomain;
+    const contactWangWang = body?.contactWangWang || '';
+    const targetUserId = body?.targetUserId || userId;
+    if (!desiredDomain) return c.json({ error: 'invalid' }, 400);
+    const gdb = getGlobalDb();
+    await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    const now = new Date().toISOString();
+    await gdb.insert(tenantRequestsTable).values({ desiredDomain, userId: targetUserId, contactWangWang, status: 'pending', createdAt: now });
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/tenant-requests error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/tenant-requests/:id/approve', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id')); if (!id) return c.json({ error: 'invalid' }, 400);
+    const gdb = getGlobalDb();
+    await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    // Provision branch for this tenant id
+    const prov = await fetch(`http://localhost:${process.env.PORT || 8787}/api/admin/tenants/${id}/provision`, { method: 'POST', headers: { Authorization: c.req.header('authorization') || '' } });
+    const pdata = await prov.json().catch(() => ({}));
+    await gdb.update(tenantRequestsTable).set({ status: 'active', vercelAssignedDomain: null, vercelDeploymentStatus: 'provisioned' }).where(eq(tenantRequestsTable.id, id));
+    return c.json({ ok: true, provision: pdata });
+  } catch (e) {
+    console.error('POST /api/admin/tenant-requests/:id/approve error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/tenant-requests/:id/reject', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id')); if (!id) return c.json({ error: 'invalid' }, 400);
+    const { reason } = await c.req.json();
+    const gdb = getGlobalDb(); await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    await gdb.update(tenantRequestsTable).set({ status: 'rejected', rejectionReason: reason || '' }).where(eq(tenantRequestsTable.id, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/tenant-requests/:id/reject error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.delete('/api/admin/tenant-requests/:id', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id')); if (!id) return c.json({ error: 'invalid' }, 400);
+    const gdb = getGlobalDb(); await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    // Lookup branch mapping and delete DB if exists
+    const br = await gdb.select().from(branchesTable).where(eq(branchesTable.tenantId, id)).limit(1);
+    const branchUrl = br?.[0]?.branchUrl || null;
+    let branchDeleteOk = false;
+    let branchDeleteError = null;
+    if (branchUrl) {
+      try {
+        const { deleteDatabaseByUrl } = await import('./tursoApi.js');
+        const ret = await deleteDatabaseByUrl(branchUrl);
+        branchDeleteOk = !!ret?.ok;
+        branchDeleteError = ret?.error || null;
+      } catch {}
+      try { await gdb.delete(branchesTable).where(eq(branchesTable.tenantId, id)); } catch {}
+    }
+    await gdb.delete(tenantRequestsTable).where(eq(tenantRequestsTable.id, id));
+    return c.json({ ok: true, deletedBranch: !!branchUrl, branchDeleteOk, branchDeleteError });
+  } catch (e) {
+    console.error('DELETE /api/admin/tenant-requests/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/admin/users/search', async (c) => {
+  try {
+    const actorId = c.get('userId'); if (!actorId) return c.json([], 401);
+    const isActorSuper = await isSuperAdminUser(actorId);
+    if (!isActorSuper) return c.json([], 403);
+    const qRaw = c.req.query('q');
+    const db = getGlobalDb();
+    const rows = await db.select().from(profiles);
+    const filtered = (rows || []).filter(r => r.id === qRaw || (r.username || '').toLowerCase().includes(qRaw) || (r.uid && String(r.uid) === qRaw));
+    return c.json(filtered);
+  } catch (e) {
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/page-content', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const tenantIdParam = Number(c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+
+    // 权限：超管或该租户的租管
+    const allowed = await canManageTenant(auth.userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+
+    const page = c.req.query('page');
+    const section = c.req.query('section');
+
+    if (!page || !section) return c.json([]);
+    const pageDef = pageConfig?.[page];
+    const secDef = pageDef?.sections?.find(s => s.id === section);
+    const forceGlobal = !!secDef?.globalOnly;
+    const db = await getTursoClientForTenant(forceGlobal ? 0 : tenantId);
+    const rows = await db
+      .select()
+      .from(pageContentTable)
+      .where(and(eq(pageContentTable.page, page), eq(pageContentTable.section, section), inArray(pageContentTable.tenantId, forceGlobal ? [0] : [tenantId, 0])))
+      .orderBy(pageContentTable.position);
+    return c.json(rows || []);
+  } catch (e) {
+    console.error('GET /api/admin/page-content error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/admin/page-content', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const body = await c.req.json();
+    const { page, section, content, position } = body || {};
+    const tenantIdParam = Number(body?.tenant_id || c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+
+    if (!page || !section) return c.json({ error: 'invalid' }, 400);
+    const pageDef = pageConfig?.[page];
+    const secDef = pageDef?.sections?.find(s => s.id === section);
+    const forceGlobal = !!secDef?.globalOnly;
+
+    // 权限：超管或该租户的租管
+    const allowed = await canManageTenant(auth.userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+
+    // 仅超管可写全局
+    if (forceGlobal) {
+      const isAdmin = await isSuperAdminUser(auth.userId);
+      if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    }
+
+    const db = await getTursoClientForTenant(tenantId);
+    const pos = typeof position === 'number' ? position : 0;
+    const value = {
+      tenantId: forceGlobal ? 0 : tenantId,
+      page,
+      section,
+      position: pos,
+      content: typeof content === 'string' ? content : JSON.stringify(content || {}),
+    };
+    await (forceGlobal ? defaultDb : db).insert(pageContentTable).values(value);
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/page-content error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.put('/api/admin/page-content/:id', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({ error: 'invalid' }, 400);
+    const body = await c.req.json();
+    const { content, position, page, section } = body || {};
+    const tenantIdParam = Number(body?.tenant_id || c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+
+    // 权限：超管或该租户的租管
+    const allowed = await canManageTenant(auth.userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+
+    const pageDef = page && pageConfig?.[page];
+    const secDef = pageDef?.sections?.find(s => s.id === section);
+    const forceGlobal = !!secDef?.globalOnly;
+    if (forceGlobal) {
+      const isAdmin = await isSuperAdminUser(auth.userId);
+      if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    }
+
+    const values = {};
+    if (position !== undefined) values.position = position;
+    if (content !== undefined) values.content = typeof content === 'string' ? content : JSON.stringify(content || {});
+    await (forceGlobal ? defaultDb : await getTursoClientForTenant(tenantId)).update(pageContentTable).set(values).where(eq(pageContentTable.id, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('PUT /api/admin/page-content/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.delete('/api/admin/page-content/:id', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({ error: 'invalid' }, 400);
+    const tenantIdParam = Number(c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+
+    // 权限：超管或该租户的租管
+    const allowed = await canManageTenant(auth.userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+
+    const db = await getTursoClientForTenant(tenantId);
+    try {
+      await db.delete(pageContentTable).where(eq(pageContentTable.id, id));
+    } catch {}
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (isAdmin) {
+      try { await defaultDb.delete(pageContentTable).where(eq(pageContentTable.id, id)); } catch {}
+    }
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/admin/page-content/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/page-content/reorder', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const { ids, page, section } = await c.req.json();
+    if (!Array.isArray(ids) || ids.length === 0) return c.json({ error: 'invalid' }, 400);
+    let forceGlobal = false;
+    if (page && section) {
+      const pageDef = pageConfig?.[page];
+      const secDef = pageDef?.sections?.find(s => s.id === section);
+      forceGlobal = !!secDef?.globalOnly;
+    }
+    const tenantIdParam = Number(c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+
+    if (forceGlobal) {
+      const isAdmin = await isSuperAdminUser(auth.userId);
+      if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    }
+
+    // 权限：超管或该租户的租管
+    const allowed = await canManageTenant(auth.userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+
+    const db = await getTursoClientForTenant(forceGlobal ? 0 : tenantId);
+    for (let i = 0; i < ids.length; i++) {
+      await db.update(pageContentTable).set({ position: i }).where(eq(pageContentTable.id, ids[i]));
+    }
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/page-content/reorder error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/admin/branches', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const db = getGlobalDb();
+    const rows = await db.select().from(branchesTable).orderBy(branchesTable.tenantId);
+    return c.json(rows || []);
+  } catch (e) {
+    console.error('GET /api/admin/branches error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/admin/branches/:id/schema', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const tenantId = Number(c.req.param('id'));
+    if (!tenantId && tenantId !== 0) return c.json({ error: 'invalid-tenant' }, 400);
+    const gdb = getGlobalDb();
+    const br = await gdb.select().from(branchesTable).where(eq(branchesTable.tenantId, tenantId)).limit(1);
+    const branchUrl = br?.[0]?.branchUrl || null;
+    if (!branchUrl) return c.json({ error: 'no-mapping' }, 404);
+    const authToken = process.env.TURSO_AUTH_TOKEN;
+    const client = createClient({ url: branchUrl, authToken });
+    // List tables
+    const tablesRes = await client.execute("select name from sqlite_schema where type='table' and name not like 'sqlite_%' order by name");
+    const tables = [];
+    for (const row of tablesRes.rows || []) {
+      const name = row.name || row[0];
+      if (!name) continue;
+      const colsRes = await client.execute(`pragma table_info(${name})`);
+      const columns = (colsRes.rows || []).map(r => ({
+        name: r.name || r[1],
+        type: r.type || r[2],
+        notnull: Number(r.notnull || r[3] || 0) === 1,
+        pk: Number(r.pk || r[5] || 0) === 1,
+        dflt_value: r.dflt_value || r[4] || null,
+      }));
+      tables.push({ name, columns });
+    }
+    return c.json({ tenantId, branchUrl, tables });
+  } catch (e) {
+    console.error('GET /api/admin/branches/:id/schema error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/admin/branches', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const { tenantId, branchUrl } = await c.req.json();
+    if (tenantId === undefined || !branchUrl) return c.json({ error: 'invalid' }, 400);
+    const db = getGlobalDb();
+    const now = new Date().toISOString();
+    const exist = await db.select().from(branchesTable).where(eq(branchesTable.tenantId, Number(tenantId))).limit(1);
+    if (exist && exist.length > 0) {
+      await db.update(branchesTable).set({ branchUrl, source: 'db', updatedBy: c.get('userId') || null, updatedAt: now }).where(eq(branchesTable.tenantId, Number(tenantId)));
+    } else {
+      await db.insert(branchesTable).values({ tenantId: Number(tenantId), branchUrl, source: 'db', updatedBy: c.get('userId') || null, updatedAt: now });
+    }
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/admin/branches error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.delete('/api/admin/branches/:tenantId', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const tenantId = Number(c.req.param('tenantId'));
+    if (!tenantId && tenantId !== 0) return c.json({ error: 'invalid' }, 400);
+    const db = getGlobalDb();
+    await db.delete(branchesTable).where(eq(branchesTable.tenantId, tenantId));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/admin/branches/:tenantId error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/admin/tenants/:id/provision', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const isAdmin = await isSuperAdminUser(auth.userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const tenantId = Number(c.req.param('id'));
+    if (!tenantId && tenantId !== 0) return c.json({ error: 'invalid-tenant' }, 400);
+
+    const dbName = process.env.TURSO_DB_NAME;
+    const region = process.env.TURSO_TENANT_REGION;
+    const branchName = `tenant-${tenantId}`;
+
+    // 1) Create branch via Turso API
+    const created = await createBranch({ dbName, branchName, region });
+    if (!created.ok) return c.json({ ok: false, step: 'create-branch', error: created.error, details: created.details }, 500);
+    const branchUrl = created.branchUrl || `${process.env.TURSO_PRIMARY_URL}?branch=${branchName}`;
+
+    // 2) Initialize schema on that branch (minimal). We reuse init statements partially.
+    const authToken = process.env.TURSO_AUTH_TOKEN;
+    const client = createClient({ url: branchUrl, authToken });
+    const statements = [
+      "create table if not exists profiles (id text primary key, username text, avatar_url text, tenant_id integer default 0, points integer default 0, created_at text, uid text)",
+      "create table if not exists posts (id integer primary key autoincrement, tenant_id integer not null default 0, author_id text not null, content text, images text, is_ad integer default 0, is_pinned integer default 0, status text default 'approved', rejection_reason text, created_at text, updated_at text)",
+      "create table if not exists comments (id integer primary key autoincrement, post_id integer not null, user_id text not null, content text, created_at text)",
+      "create table if not exists likes (post_id integer not null, user_id text not null, primary key (post_id, user_id))",
+      "create table if not exists notifications (id integer primary key autoincrement, user_id text not null, content text, is_read integer default 0, created_at text)",
+      "create table if not exists app_settings (tenant_id integer not null, key text not null, value text, name text, description text, type text, primary key (tenant_id, key))",
+      "create table if not exists page_content (id integer primary key autoincrement, tenant_id integer not null default 0, page text not null, section text not null, position integer default 0, content text)",
+      // indexes
+      "create index if not exists idx_posts_tenant_status_ad_pin_created on posts(tenant_id, status, is_ad, is_pinned, created_at)",
+      "create index if not exists idx_comments_post_created on comments(post_id, created_at)",
+      "create index if not exists idx_likes_post on likes(post_id)",
+      "create index if not exists idx_notifications_user_read_created on notifications(user_id, is_read, created_at)",
+      "create index if not exists idx_page_content_scope on page_content(tenant_id, page, section, position)",
+    ];
+    for (const s of statements) { try { await client.execute(s); } catch {} }
+    try { await client.execute("create unique index if not exists idx_profiles_uid on profiles(uid)"); } catch {}
+
+    // 2.5) Seed minimal demo data on new branch
+    const nowIso = new Date().toISOString();
+    await client.execute("insert into profiles(id, username, tenant_id, points, created_at, uid) values (?, ?, ?, ?, ?, ?)", [
+      'tenant-user-1', '演示用户1', tenantId, 0, nowIso, String(Math.floor(100000 + Math.random() * 900000))
+    ]);
+    await client.execute("insert into posts(tenant_id, author_id, content, images, is_ad, is_pinned, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, 'approved', ?, ?)", [
+      tenantId, 'tenant-user-1', '欢迎来到分站（自动开通）', JSON.stringify([]), 0, 1, nowIso, nowIso
+    ]);
+    await client.execute("insert into page_content(tenant_id, page, section, position, content) values (?, 'home', 'announcements', 0, ?)", [
+      tenantId, JSON.stringify({ text: '🎉 分站已开通，欢迎体验！' })
+    ]);
+
+    // 3) Persist mapping in branches table (global DB)
+    const gdb = getGlobalDb();
+    const now = new Date().toISOString();
+    const exist = await gdb.select().from(branchesTable).where(eq(branchesTable.tenantId, tenantId)).limit(1);
+    if (exist && exist.length > 0) {
+      await gdb.update(branchesTable).set({ branchUrl, source: 'db', updatedBy: c.get('userId') || null, updatedAt: now }).where(eq(branchesTable.tenantId, tenantId));
+    } else {
+      await gdb.insert(branchesTable).values({ tenantId, branchUrl, source: 'db', updatedBy: c.get('userId') || null, updatedAt: now });
+    }
+
+    return c.json({ ok: true, tenantId, branchUrl });
+  } catch (e) {
+    console.error('POST /api/admin/tenants/:id/provision error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+// Shared forum endpoints (global)
+app.get('/api/shared/posts', async (c) => {
+  __setCache(c, 30);
+  try {
+    await ensureSharedForumSchema();
+    const db = getGlobalDb();
+    const page = Number(c.req.query('page') || 0);
+    const size = Math.min(Number(c.req.query('size') || 10), 50);
+    const rows = await db.select().from(sharedPosts).orderBy(desc(sharedPosts.isPinned), desc(sharedPosts.createdAt)).limit(size).offset(page * size);
+    const authorIds = Array.from(new Set((rows || []).map(r => r.authorId)));
+    let authors = [];
+    if (authorIds.length) authors = await db.select().from(sharedProfiles).where(inArray(sharedProfiles.id, authorIds));
+    // ensure uid for authors
+    for (const a of authors || []) {
+      if (!a.uid) { try { await ensureUid(getGlobalDb(), profiles, profiles.id, a.id); } catch {} }
+    }
+    const rereadAuthors = authorIds.length ? await db.select().from(sharedProfiles).where(inArray(sharedProfiles.id, authorIds)) : [];
+    const authorMap = new Map(rereadAuthors.map(a => [a.id, { id: a.id, username: a.username, avatar_url: a.avatarUrl, uid: a.uid }]));
+    // counts
+    const withCounts = [];
+    const userId = c.get('userId');
+    // prefetch likedByMe map
+    let likedSet = new Set();
+    if (userId && (rows || []).length > 0) {
+      const ids = (rows || []).map(r => r.id);
+      const likedRows = await db.select({ pid: sharedLikes.postId }).from(sharedLikes).where(and(eq(sharedLikes.userId, userId), inArray(sharedLikes.postId, ids)));
+      likedSet = new Set((likedRows || []).map(r => r.pid));
+    }
+    for (const r of rows || []) {
+      const lc = await db.select({ c: sql`count(1)` }).from(sharedLikes).where(eq(sharedLikes.postId, r.id));
+      const cc = await db.select({ c: sql`count(1)` }).from(sharedComments).where(eq(sharedComments.postId, r.id));
+      withCounts.push({
+        ...r,
+        author: authorMap.get(r.authorId) || null,
+        likesCount: Number(lc?.[0]?.c || 0),
+        commentsCount: Number(cc?.[0]?.c || 0),
+        likedByMe: userId ? likedSet.has(r.id) : false,
+      });
+    }
+    return c.json(withCounts);
+  } catch (e) {
+    console.error('GET /api/shared/posts error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/shared/posts', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const body = await c.req.json();
+    const content = String(body?.content || '');
+    const images = Array.isArray(body?.images) ? body.images : [];
+    const now = new Date().toISOString();
+    // ensure profile exists
+    const prof = await db.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1);
+    if (!prof || prof.length === 0) await db.insert(sharedProfiles).values({ id: userId, username: '用户', createdAt: now });
+    await db.insert(sharedPosts).values({ authorId: userId, content, images: JSON.stringify(images), isPinned: 0, status: 'approved', createdAt: now, updatedAt: now });
+    const lastRows = await db.select({ id: sharedPosts.id }).from(sharedPosts).orderBy(desc(sharedPosts.id)).limit(1);
+    const id = Number(lastRows?.[0]?.id || 0);
+    const author = (await db.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1))?.[0] || null;
+    const created = { id, authorId: userId, content, images: JSON.stringify(images), isPinned: 0, status: 'approved', createdAt: now, updatedAt: now, author: author ? { id: author.id, username: author.username, avatar_url: author.avatarUrl } : null, likesCount: 0, commentsCount: 0 };
+    return c.json(created);
+  } catch (e) {
+    console.error('POST /api/shared/posts error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.get('/api/shared/comments', async (c) => {
+  try {
+    const db = getGlobalDb();
+    const postId = Number(c.req.query('postId'));
+    if (!postId) return c.json([]);
+    const rows = await db.select().from(sharedComments).where(eq(sharedComments.postId, postId)).orderBy(desc(sharedComments.createdAt));
+    const authorIds = Array.from(new Set(rows.map(r => r.userId)));
+    let authors = [];
+    if (authorIds.length) authors = await db.select().from(sharedProfiles).where(inArray(sharedProfiles.id, authorIds));
+    const authorMap = new Map(authors.map(a => [a.id, { id: a.id, username: a.username, avatar_url: a.avatarUrl, uid: a.uid }]));
+    const res = rows.map(r => ({ ...r, author: authorMap.get(r.userId) || null }));
+    return c.json(res);
+  } catch (e) {
+    console.error('GET /api/shared/comments error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/shared/comments', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const body = await c.req.json();
+    const { postId, content } = body || {};
+    if (!postId || !content) return c.json({ error: 'invalid' }, 400);
+    const now = new Date().toISOString();
+    // deduct comment cost from global profile
+    try {
+      const map = await readSettingsMap();
+      const cost = toInt(map['comment_cost'], 1);
+      const pdb = await getTursoClientForTenant(0);
+      const prof = (await pdb.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+      if ((prof?.points || 0) < cost) return c.json({ error: 'insufficient-points' }, 400);
+      await pdb.update(profiles).set({ points: (prof?.points || 0) - cost }).where(eq(profiles.id, userId));
+      await pdb.insert(pointsHistoryTable).values({ userId, changeAmount: -cost, reason: '发表评论', createdAt: now });
+    } catch {}
+    await db.insert(sharedComments).values({ postId, userId, content, createdAt: now });
+    const prof = await db.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1);
+    if (!prof || prof.length === 0) {
+      await db.insert(sharedProfiles).values({ id: userId, username: '用户', createdAt: now });
+    }
+    try { await ensureUid(getGlobalDb(), profiles, profiles.id, userId); } catch {}
+    const author = (await db.select().from(sharedProfiles).where(eq(sharedProfiles.id, userId)).limit(1))?.[0] || null;
+    return c.json({ id: undefined, postId, userId, content, created_at: now, author: author ? { id: author.id, username: author.username, avatar_url: author.avatarUrl } : null });
+  } catch (e) {
+    console.error('POST /api/shared/comments error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.delete('/api/shared/comments/:id', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({ ok: false });
+    // only author can delete
+    const rows = await db.select().from(sharedComments).where(eq(sharedComments.id, id)).limit(1);
+    if (!rows || rows.length === 0 || rows[0].userId !== userId) return c.json({ ok: false, error: 'forbidden' }, 403);
+    await db.delete(sharedComments).where(eq(sharedComments.id, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/shared/comments/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/shared/likes', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    await ensureSharedForumSchema();
+    const db = getGlobalDb();
+    const { postId } = await c.req.json();
+    if (!postId) return c.json({ error: 'invalid' }, 400);
+    await db.insert(sharedLikes).values({ postId, userId });
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/shared/likes error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.delete('/api/shared/likes', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    await ensureSharedForumSchema();
+    const db = getGlobalDb();
+    const { postId } = await c.req.json();
+    if (!postId) return c.json({ error: 'invalid' }, 400);
+    await db.delete(sharedLikes).where(and(eq(sharedLikes.postId, postId), eq(sharedLikes.userId, userId)));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/shared/likes error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.delete('/api/shared/posts/:id', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({ ok: false });
+    const rows = await db.select().from(sharedPosts).where(eq(sharedPosts.id, id)).limit(1);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!rows || rows.length === 0 || (!isAdmin && rows[0].authorId !== userId)) return c.json({ ok: false, error: 'forbidden' }, 403);
+    await db.delete(sharedComments).where(eq(sharedComments.postId, id));
+    await db.delete(sharedLikes).where(eq(sharedLikes.postId, id));
+    await db.delete(sharedPosts).where(eq(sharedPosts.id, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/shared/posts/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/shared/posts/:id/pin', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const db = getGlobalDb();
+    const id = Number(c.req.param('id'));
+    const { pinned } = await c.req.json();
+    await db.update(sharedPosts).set({ isPinned: pinned ? 1 : 0 }).where(eq(sharedPosts.id, id));
+    const rows = await db.select().from(sharedPosts).where(eq(sharedPosts.id, id)).limit(1);
+    return c.json(rows?.[0] || { id, is_pinned: pinned ? 1 : 0 });
+  } catch (e) {
+    console.error('POST /api/shared/posts/:id/pin error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/posts', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const body = await c.req.json();
+    const content = String(body?.content || '');
+    const images = Array.isArray(body?.images) ? body.images : [];
+    const isAd = body?.isAd ? 1 : 0;
+    const now = new Date().toISOString();
+    // ensure profile exists
+    const p = await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1);
+    if (!p || p.length === 0) { await db.insert(profiles).values({ id: userId, username: '用户', tenantId, points: 0, createdAt: now }); }
+    await ensureUid(db, profiles, profiles.id, userId);
+    // deduct cost from global profile using settings
+    try {
+      const map = await readSettingsMap();
+      const socialCost = toInt(map['social_post_cost'], 100);
+      const adCost = toInt(map['ad_post_cost'], 200);
+      const cost = isAd ? adCost : socialCost;
+      const pdb = await getTursoClientForTenant(0);
+      const gprof = (await pdb.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+      if ((gprof?.freePostsCount || 0) > 0 && body?.useFreePost) {
+        await pdb.update(profiles).set({ freePostsCount: (gprof.freePostsCount || 0) - 1 }).where(eq(profiles.id, userId));
+      } else {
+        if ((gprof?.points || 0) < cost) return c.json({ error: 'insufficient-points' }, 400);
+        await pdb.update(profiles).set({ points: (gprof?.points || 0) - cost }).where(eq(profiles.id, userId));
+        await pdb.insert(pointsHistoryTable).values({ userId, changeAmount: -cost, reason: isAd ? '发布广告' : '发布动态', createdAt: now });
+      }
+    } catch {}
+    await db.insert(postsTable).values({ tenantId, authorId: userId, content, images: JSON.stringify(images), isAd, isPinned: 0, status: 'approved', createdAt: now, updatedAt: now });
+    const lastRows = await db.select({ id: postsTable.id }).from(postsTable).orderBy(desc(postsTable.id)).limit(1);
+    const id = Number(lastRows?.[0]?.id || 0);
+    const author = (await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0] || null;
+    const created = { id, tenantId, authorId: userId, content, images: JSON.stringify(images), isAd, isPinned: 0, status: 'approved', createdAt: now, updatedAt: now, author: author ? { id: author.id, username: author.username, avatar_url: author.avatarUrl } : null, likesCount: 0, commentsCount: 0 };
+    return c.json(created);
+  } catch (e) {
+    console.error('POST /api/posts error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.put('/api/admin/users/:id', async (c) => {
+  try {
+    const actorId = c.get('userId'); if (!actorId) return c.json({ error: 'unauthorized' }, 401);
+    const isActorSuper = await isSuperAdminUser(actorId);
+    if (!isActorSuper) return c.json({ error: 'forbidden' }, 403);
+    const id = c.req.param('id'); if (!id) return c.json({ error: 'invalid' }, 400);
+    const body = await c.req.json();
+    const { uid, username, points, virtual_currency, free_posts_count } = body || {};
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column uid text"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("create unique index if not exists idx_profiles_uid on profiles(uid)"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column virtual_currency integer default 0"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column invitation_points integer default 0"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column free_posts_count integer default 0"); } catch {}
+    // Validate uid if provided
+    if (uid !== undefined) {
+      const str = String(uid);
+      if (!/^\d{6}$/.test(str)) return c.json({ error: 'invalid-uid' }, 400);
+      const conflict = await db.select().from(profiles).where(and(eq(profiles.uid, str), sql`${profiles.id} <> ${id}`)).limit(1);
+      if (conflict && conflict.length > 0) return c.json({ error: 'uid-conflict' }, 409);
+    }
+    const updateValues = {};
+    if (username !== undefined) updateValues.username = username;
+    if (points !== undefined) updateValues.points = Number(points) || 0;
+    if (virtual_currency !== undefined) updateValues.virtualCurrency = Number(virtual_currency) || 0;
+    if (free_posts_count !== undefined) updateValues.freePostsCount = Number(free_posts_count) || 0;
+    if (uid !== undefined) updateValues.uid = String(uid);
+    if (Object.keys(updateValues).length > 0) {
+      await db.update(profiles).set(updateValues).where(eq(profiles.id, id));
+    }
+    // sync shared_profiles uid if provided and no conflict
+    if (uid !== undefined) {
+      const gdb = getGlobalDb();
+      try { const rawG = getGlobalClient(); await rawG.execute("alter table shared_profiles add column uid text"); } catch {}
+      try { const rawG = getGlobalClient(); await rawG.execute("create unique index if not exists idx_shared_profiles_uid on shared_profiles(uid)"); } catch {}
+      const sconf = await gdb.select().from(sharedProfiles).where(and(eq(sharedProfiles.uid, String(uid)), sql`${sharedProfiles.id} <> ${id}`)).limit(1);
+      if (!sconf || sconf.length === 0) {
+        const exists = await gdb.select().from(sharedProfiles).where(eq(sharedProfiles.id, id)).limit(1);
+        if (exists && exists.length > 0) {
+          await gdb.update(sharedProfiles).set({ uid: String(uid) }).where(eq(sharedProfiles.id, id));
+        }
+      }
+    }
+    const rows = await db.select().from(profiles).where(eq(profiles.id, id)).limit(1);
+    return c.json(rows?.[0] || {});
+  } catch (e) {
+    console.error('PUT /api/admin/users/:id error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/admin/tenants/:id/delete-branch', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const tenantId = Number(c.req.param('id'));
+    if (!tenantId && tenantId !== 0) return c.json({ error: 'invalid-tenant' }, 400);
+    const gdb = getGlobalDb();
+    const br = await gdb.select().from(branchesTable).where(eq(branchesTable.tenantId, tenantId)).limit(1);
+    const branchUrl = br?.[0]?.branchUrl || null;
+    if (!branchUrl) return c.json({ ok: true, deletedBranch: false, reason: 'no-mapping' });
+    let ret = { ok: false };
+    try {
+      const { deleteDatabaseByUrl } = await import('./tursoApi.js');
+      ret = await deleteDatabaseByUrl(branchUrl);
+    } catch (e) {
+      ret = { ok: false, error: e.message };
+    }
+    try { await gdb.delete(branchesTable).where(eq(branchesTable.tenantId, tenantId)); } catch {}
+    return c.json({ ok: true, deletedBranch: true, branchDeleteOk: !!ret?.ok, branchDeleteError: ret?.error || null });
+  } catch (e) {
+    console.error('POST /api/admin/tenants/:id/delete-branch error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/admin/databases', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const gdb = getGlobalDb();
+    const { listAllDatabases } = await import('./tursoApi.js');
+    const list = await listAllDatabases();
+    // Try to derive tenantId from name pattern tenant-{id}
+    const withTenant = (list || []).map(d => {
+      const m = /^tenant-(\d+)$/i.exec(d.name || '');
+      const tenantId = m ? Number(m[1]) : null;
+      return { ...d, tenantId };
+    });
+    // Filter out primary database by env name (TURSO_DB_NAME)
+    const primaryName = process.env.TURSO_DB_NAME;
+    const filtered = withTenant.filter(d => !primaryName || (d.name !== primaryName));
+    // Join mapping table
+    const mappings = await gdb.select().from(branchesTable);
+    const mapByTenant = new Map((mappings || []).map(m => [Number(m.tenantId), m]));
+    // Resolve owner by tenant_requests.user_id -> profiles.username (global DB)
+    const tenantIds = Array.from(new Set(filtered.map(x => x.tenantId).filter(x => x !== null)));
+    let owners = new Map();
+    if (tenantIds.length) {
+      const trs = await gdb.select().from(tenantRequestsTable);
+      const byId = new Map((trs || []).map(t => [Number(t.id), t.userId]));
+      const userIds = Array.from(new Set(tenantIds.map(tid => byId.get(Number(tid))).filter(Boolean)));
+      let profilesRows = [];
+      if (userIds.length) profilesRows = await gdb.select().from(profiles);
+      const pmap = new Map((profilesRows || []).map(p => [p.id, p.username]));
+      for (const tid of tenantIds) {
+        const uid = byId.get(Number(tid));
+        if (uid) owners.set(Number(tid), pmap.get(uid) || uid);
+      }
+    }
+    const result = filtered.map(d => {
+      const m = d.tenantId !== null ? mapByTenant.get(Number(d.tenantId)) : null;
+      return {
+        name: d.name,
+        hostname: d.hostname,
+        tenantId: d.tenantId,
+        mapped: !!m,
+        branchUrl: m?.branchUrl || null,
+        owner: d.tenantId !== null ? (owners.get(Number(d.tenantId)) || null) : null,
+      };
+    });
+    return c.json(result);
+  } catch (e) {
+    console.error('GET /api/admin/databases error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/admin/databases/:name/delete', async (c) => {
+  try {
+    const auth = requireAdmin(c);
+    if (!auth.ok) return c.json({ error: auth.reason }, 401);
+    const name = c.req.param('name');
+    if (!name) return c.json({ error: 'invalid-name' }, 400);
+    if (process.env.TURSO_DB_NAME && name === process.env.TURSO_DB_NAME) {
+      return c.json({ ok: false, error: 'cannot-delete-primary' }, 400);
+    }
+    const { deleteDatabaseByName } = await import('./tursoApi.js');
+    const ret = await deleteDatabaseByName(name);
+    return c.json({ ok: !!ret?.ok, error: ret?.error || null });
+  } catch (e) {
+    console.error('POST /api/admin/databases/:name/delete error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+// Points: history
+app.get('/api/points/history', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json([], 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const dbTenant = await getTursoClientForTenant(tenantId);
+    const dbGlobal = await getTursoClientForTenant(0);
+    // ensure table exists in both scopes
+    try {
+      if (!__ensureCache.pointsHistory.has(Number(tenantId))) {
+        const raw = await getLibsqlClientForTenantRaw(tenantId);
+        try { await raw.execute("create table if not exists points_history (id integer primary key autoincrement, user_id text not null, change_amount integer not null, reason text not null, created_at text default (datetime('now')))"); } catch {}
+        __ensureCache.pointsHistory.add(Number(tenantId));
+      }
+    } catch {}
+    try {
+      if (!__ensureCache.pointsHistory.has(0)) {
+        const raw = await getLibsqlClientForTenantRaw(0);
+        try { await raw.execute("create table if not exists points_history (id integer primary key autoincrement, user_id text not null, change_amount integer not null, reason text not null, created_at text default (datetime('now')))"); } catch {}
+        __ensureCache.pointsHistory.add(0);
+      }
+    } catch {}
+    const rowsTenant = await dbTenant.select().from(pointsHistoryTable).where(eq(pointsHistoryTable.userId, userId));
+    const rowsGlobal = await dbGlobal.select().from(pointsHistoryTable).where(eq(pointsHistoryTable.userId, userId));
+    const mappedTenant = (rowsTenant || []).map(r => ({
+      id: r.id,
+      user_id: r.userId,
+      change_amount: r.changeAmount,
+      reason: r.reason,
+      created_at: r.createdAt,
+      scope: 'tenant',
+    }));
+    const mappedGlobal = (rowsGlobal || []).map(r => ({
+      id: r.id,
+      user_id: r.userId,
+      change_amount: r.changeAmount,
+      reason: r.reason,
+      created_at: r.createdAt,
+      scope: 'global',
+    }));
+    const all = [...mappedTenant, ...mappedGlobal].sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    });
+    return c.json(all);
+  } catch (e) {
+    console.error('GET /api/points/history error', e);
+    return c.json([]);
+  }
+});
+
+// Points: exchange between points and virtual currency
+app.post('/api/points/exchange', async (c) => {
+  try {
+    const userId = c.get('userId');
+    if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { mode, pointsAmount, currencyAmount } = await c.req.json();
+    if (!mode || (!pointsAmount && !currencyAmount)) return c.json({ error: 'invalid' }, 400);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    // ensure columns
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column virtual_currency integer default 0"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column invitation_points integer default 0"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("alter table profiles add column free_posts_count integer default 0"); } catch {}
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("create table if not exists points_history (id integer primary key autoincrement, user_id text not null, change_amount integer not null, reason text not null, created_at text default (datetime('now')))" ); } catch {}
+    const now = new Date().toISOString();
+    const prof = (await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+    if (!prof) return c.json({ error: 'profile-not-found' }, 404);
+    if (mode === 'pointsToCurrency') {
+      const p = Number(pointsAmount) || 0;
+      const cny = Number(currencyAmount) || 0;
+      if (p <= 0 || cny <= 0) return c.json({ error: 'invalid-amount' }, 400);
+      if ((prof.points || 0) < p) return c.json({ error: 'insufficient-points' }, 400);
+      await db.update(profiles).set({ points: (prof.points || 0) - p, virtualCurrency: (prof.virtualCurrency || 0) + cny }).where(eq(profiles.id, userId));
+      await db.insert(pointsHistoryTable).values({ userId, changeAmount: -p, reason: '兑换虚拟分', createdAt: now });
+    } else if (mode === 'currencyToPoints') {
+      const cny = Number(currencyAmount) || 0;
+      const p = Number(pointsAmount) || 0;
+      if (p <= 0 || cny <= 0) return c.json({ error: 'invalid-amount' }, 400);
+      if ((prof.virtualCurrency || 0) < cny) return c.json({ error: 'insufficient-currency' }, 400);
+      await db.update(profiles).set({ points: (prof.points || 0) + p, virtualCurrency: (prof.virtualCurrency || 0) - cny }).where(eq(profiles.id, userId));
+      await db.insert(pointsHistoryTable).values({ userId, changeAmount: +p, reason: '虚拟分兑入', createdAt: now });
+    } else {
+      return c.json({ error: 'unsupported-mode' }, 400);
+    }
+    const updated = (await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+    return c.json({ ok: true, profile: updated });
+  } catch (e) {
+    console.error('POST /api/points/exchange error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// ---------- Shop: Products ----------
+app.get('/api/shop/products', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const dbTenant = await getTursoClientForTenant(tenantId);
+    const dbGlobal = await getTursoClientForTenant(0);
+
+    let rowsGlobal = [];
+    let rowsTenant = [];
+    try { rowsGlobal = await dbGlobal.select().from(shopProducts).where(eq(shopProducts.tenantId, 0)); } catch {}
+    try { if (tenantId !== 0) rowsTenant = await dbTenant.select().from(shopProducts).where(eq(shopProducts.tenantId, tenantId)); } catch {}
+
+    // Auto seed demo products to global in dev when empty
+    if ((rowsGlobal.length + rowsTenant.length) === 0 && process.env.NODE_ENV !== 'production') {
+      const now = new Date().toISOString();
+      try {
+        await dbGlobal.insert(shopProducts).values({ tenantId: 0, name: '新手礼包', description: '入门福利礼包', imageUrl: null, price: 200, stock: -1, isActive: 1, createdAt: now });
+        await dbGlobal.insert(shopProducts).values({ tenantId: 0, name: '头像框·星月', description: '限时装饰', imageUrl: null, price: 500, stock: 100, isActive: 1, createdAt: now });
+        await dbGlobal.insert(shopProducts).values({ tenantId: 0, name: '改名卡', description: '修改昵称一次', imageUrl: null, price: 300, stock: -1, isActive: 1, createdAt: now });
+      } catch {}
+      try { rowsGlobal = await dbGlobal.select().from(shopProducts).where(eq(shopProducts.tenantId, 0)); } catch {}
+    }
+
+    const list = [
+      ...(rowsGlobal || []).map(r => ({ ...r, __source: 'global' })),
+      ...(rowsTenant || []).map(r => ({ ...r, __source: 'tenant' })),
+    ];
+    return c.json(list);
+  } catch (e) {
+    console.error('GET /api/shop/products error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/shop/products', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const body = await c.req.json();
+    const now = new Date().toISOString();
+    const record = {
+      tenantId,
+      name: body?.name || '',
+      description: body?.description || '',
+      imageUrl: body?.image_url || null,
+      price: Number(body?.price || 0),
+      stock: body?.stock === -1 ? -1 : Number(body?.stock || 0),
+      isActive: body?.is_active ? 1 : 0,
+      createdAt: now,
+    };
+    // upsert by id if provided
+    if (body?.id) {
+      await db.update(shopProducts).set(record).where(eq(shopProducts.id, Number(body.id)));
+      const rows = await db.select().from(shopProducts).where(eq(shopProducts.id, Number(body.id))).limit(1);
+      return c.json(rows?.[0] || record);
+    } else {
+      await db.insert(shopProducts).values(record);
+      const last = await db.select({ id: shopProducts.id }).from(shopProducts).orderBy(desc(shopProducts.id)).limit(1);
+      const id = Number(last?.[0]?.id || 0);
+      const rows = await db.select().from(shopProducts).where(eq(shopProducts.id, id)).limit(1);
+      return c.json(rows?.[0] || { id, ...record });
+    }
+  } catch (e) {
+    console.error('POST /api/shop/products error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.delete('/api/shop/products/:id', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.delete(shopProducts).where(eq(shopProducts.id, id));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/shop/products/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+// ---------- Shop: Redeem ----------
+app.post('/api/shop/redeem', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const body = await c.req.json();
+    const productId = Number(body?.productId);
+    const source = String(body?.source || 'tenant');
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const dbTenant = await getTursoClientForTenant(tenantId);
+    const dbGlobal = await getTursoClientForTenant(0);
+    const now = new Date().toISOString();
+
+    // load product with fallback
+    let product = null;
+    if (source === 'global') {
+      product = (await dbGlobal.select().from(shopProducts).where(eq(shopProducts.id, productId)).limit(1))?.[0];
+      if (!product) {
+        product = (await dbTenant.select().from(shopProducts).where(eq(shopProducts.id, productId)).limit(1))?.[0];
+      }
+    } else {
+      product = (await dbTenant.select().from(shopProducts).where(eq(shopProducts.id, productId)).limit(1))?.[0];
+      if (!product) {
+        product = (await dbGlobal.select().from(shopProducts).where(eq(shopProducts.id, productId)).limit(1))?.[0];
+      }
+    }
+
+    const isActive = product && (product.isActive === 1 || product.isActive === '1' || product.isActive === true);
+    if (!product || !isActive) return c.json({ error: 'product-not-available' }, 400);
+
+    // permission: allow tenant purchase for global (tenantId=0) or same-tenant products
+    if (product.tenantId !== 0 && Number(product.tenantId) !== Number(tenantId)) return c.json({ error: 'forbidden' }, 403);
+
+    // deduct points from tenant profile
+    const prof = (await dbTenant.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+    if (!prof) return c.json({ error: 'profile-not-found' }, 404);
+    if ((prof.points || 0) < product.price) return c.json({ error: 'insufficient-points' }, 400);
+    if (product.stock !== -1 && product.stock <= 0) return c.json({ error: 'out-of-stock' }, 400);
+
+    await dbTenant.update(profiles).set({ points: (prof.points || 0) - product.price }).where(eq(profiles.id, userId));
+    await dbTenant.insert(pointsHistoryTable).values({ userId, changeAmount: -product.price, reason: '积分商城兑换', createdAt: now });
+
+    // ensure snapshot columns exist for redemptions (tenant DB)
+    try {
+      const rawT = await getLibsqlClientForTenantRaw(tenantId);
+      try { await rawT.execute("alter table shop_redemptions add column product_name text"); } catch {}
+      try { await rawT.execute("alter table shop_redemptions add column product_image_url text"); } catch {}
+      try { await rawT.execute("alter table shop_redemptions add column product_price integer"); } catch {}
+    } catch {}
+
+    // create redemption in tenant DB
+    await dbTenant.insert(shopRedemptions).values({
+      tenantId,
+      productId: product.id,
+      userId,
+      pointsSpent: product.price,
+      status: 'pending',
+      productName: product.name || null,
+      productImageUrl: product.imageUrl || null,
+      productPrice: product.price || null,
+      createdAt: now,
+    });
+
+    // decrease stock in the product's own DB
+    if (product.stock !== -1) {
+      if (Number(product.tenantId) === 0) {
+        await dbGlobal.update(shopProducts).set({ stock: product.stock - 1 }).where(eq(shopProducts.id, product.id));
+      } else {
+        await dbTenant.update(shopProducts).set({ stock: product.stock - 1 }).where(eq(shopProducts.id, product.id));
+      }
+    }
+
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/shop/redeem error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.get('/api/shop/redemptions', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const dbTenant = await getTursoClientForTenant(tenantId);
+    const dbGlobal = await getTursoClientForTenant(0);
+
+    const scope = String(c.req.query('scope') || '').toLowerCase();
+    const reqTenantIdRaw = c.req.query('tenantId');
+    const reqTenantId = reqTenantIdRaw != null ? Number(reqTenantIdRaw) : null;
+    const isAdmin = await isSuperAdminUser(userId);
+
+    // pagination
+    const page = Math.max(0, Number(c.req.query('page') || 0));
+    const size = Math.min(100, Math.max(1, Number(c.req.query('size') || 20)));
+
+    // filters
+    const fStatus = (() => { const s = String(c.req.query('status') || '').trim(); return s ? s : null; })();
+    const fProductId = (() => { const v = c.req.query('productId'); if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
+    const fUid = (() => { const u = String(c.req.query('uid') || '').trim(); return u || null; })();
+
+    function applyFilters(list) {
+      return (list || []).filter(item => {
+        if (fStatus && String(item.status) !== fStatus) return false;
+        if (fProductId != null && Number(item.product_id) !== Number(fProductId)) return false;
+        if (fUid && (!item.user || String(item.user.uid) !== String(fUid))) return false;
+        return true;
+      });
+    }
+
+    // Helper to load one-tenant redemptions list and normalize fields
+    async function loadTenantRedemptions(tId) {
+      const tDb = await getTursoClientForTenant(tId);
+      let rows = [];
+      try {
+        rows = await tDb.select().from(shopRedemptions).where(eq(shopRedemptions.tenantId, tId)).orderBy(desc(shopRedemptions.createdAt));
+      } catch { rows = []; }
+      if (!rows || rows.length === 0) return [];
+      // enrich minimal user info from that tenant DB
+      const userIds = Array.from(new Set(rows.map(r => r.userId)));
+      let users = [];
+      try { users = userIds.length ? await tDb.select().from(profiles).where(inArray(profiles.id, userIds)) : []; } catch {}
+      const umap = new Map((users || []).map(u => [u.id, u]));
+      // product snapshot fallback; try live lookup from proper DB if possible
+      const productIds = Array.from(new Set(rows.map(r => r.productId)));
+      let tProducts = [];
+      try { tProducts = productIds.length ? await tDb.select().from(shopProducts).where(inArray(shopProducts.id, productIds)) : []; } catch {}
+      let gProducts = [];
+      try { gProducts = productIds.length ? await dbGlobal.select().from(shopProducts).where(inArray(shopProducts.id, productIds)) : []; } catch {}
+      const pmap = new Map([...(tProducts || []), ...(gProducts || [])].map(p => [p.id, p]));
+      return (rows || []).map(r => {
+        const pm = pmap.get(r.productId) || null;
+        const prod = pm ? pm : (r.productName || r.productPrice || r.productImageUrl ? {
+          id: r.productId,
+          name: r.productName || '已下架商品',
+          imageUrl: r.productImageUrl || null,
+          price: r.productPrice || r.pointsSpent || 0,
+        } : null);
+        const u = umap.get(r.userId) || null;
+        return {
+          id: r.id,
+          tenant_id: r.tenantId,
+          product_id: r.productId,
+          user_id: r.userId,
+          points_spent: r.pointsSpent,
+          status: r.status,
+          notes: r.notes || null,
+          product_name: r.productName || null,
+          product_image_url: r.productImageUrl || null,
+          product_price: r.productPrice || null,
+          created_at: r.createdAt,
+          product: prod,
+          user: u ? { id: u.id, username: u.username, uid: u.uid } : null,
+        };
+      });
+    }
+
+    // Admin: aggregate across all tenants (default for super admin when no filters)
+    if (isAdmin && (scope === 'all' || (!c.req.query('scope') && reqTenantId == null))) {
+      // collect all tenant ids (0 + tenant_requests ids)
+      let tenantIds = [0];
+      try {
+        const trs = await dbGlobal.select().from(tenantRequestsTable);
+        tenantIds = [0, ...new Set((trs || []).map(t => Number(t.id)).filter(n => Number.isFinite(n)))];
+      } catch {}
+      let all = [];
+      for (const tId of tenantIds) {
+        try {
+          const list = await loadTenantRedemptions(tId);
+          if (list && list.length) all.push(...list);
+        } catch {}
+      }
+      all = applyFilters(all);
+      all.sort((a, b) => {
+        const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return tb - ta;
+      });
+      const total = all.length;
+      const start = page * size;
+      const end = start + size;
+      const data = all.slice(start, end);
+      const nextPage = end < total ? page + 1 : undefined;
+      return c.json({ data, nextPage, total });
+    }
+
+    // Admin: specify a tenantId to view
+    if (isAdmin && reqTenantId != null && Number.isFinite(reqTenantId)) {
+      let list = await loadTenantRedemptions(reqTenantId);
+      list = applyFilters(list);
+      list.sort((a, b) => {
+        const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return tb - ta;
+      });
+      const total = list.length;
+      const start = page * size;
+      const end = start + size;
+      const data = list.slice(start, end);
+      const nextPage = end < total ? page + 1 : undefined;
+      return c.json({ data, nextPage, total });
+    }
+
+    // Default: current tenant only
+    const rows = await dbTenant.select().from(shopRedemptions).where(eq(shopRedemptions.tenantId, tenantId)).orderBy(desc(shopRedemptions.createdAt));
+    // enrich from tenant + global, fallback to snapshot
+    const productIds = Array.from(new Set((rows || []).map(r => r.productId)));
+    const userIds = Array.from(new Set((rows || []).map(r => r.userId)));
+    const [tenantProducts, globalProducts, users] = await Promise.all([
+      productIds.length ? dbTenant.select().from(shopProducts).where(inArray(shopProducts.id, productIds)) : Promise.resolve([]),
+      productIds.length ? dbGlobal.select().from(shopProducts).where(inArray(shopProducts.id, productIds)) : Promise.resolve([]),
+      userIds.length ? dbTenant.select().from(profiles).where(inArray(profiles.id, userIds)) : Promise.resolve([]),
+    ]);
+    const pmap = new Map([...(tenantProducts || []), ...(globalProducts || [])].map(p => [p.id, p]));
+    const umap = new Map((users || []).map(u => [u.id, u]));
+    let list = (rows || []).map(r => {
+      const pm = pmap.get(r.productId) || null;
+      const prod = pm ? pm : (r.productName || r.productPrice || r.productImageUrl ? {
+        id: r.productId,
+        name: r.productName || '已下架商品',
+        imageUrl: r.productImageUrl || null,
+        price: r.productPrice || r.pointsSpent || 0,
+      } : null);
+      const u = umap.get(r.userId) || null;
+      return {
+        id: r.id,
+        tenant_id: r.tenantId,
+        product_id: r.productId,
+        user_id: r.userId,
+        points_spent: r.pointsSpent,
+        status: r.status,
+        notes: r.notes || null,
+        product_name: r.productName || null,
+        product_image_url: r.productImageUrl || null,
+        product_price: r.productPrice || null,
+        created_at: r.createdAt,
+        product: prod,
+        user: u ? { id: u.id, username: u.username, uid: u.uid } : null,
+      };
+    });
+    list = applyFilters(list);
+    list.sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    });
+    const total = list.length;
+    const start = page * size;
+    const end = start + size;
+    const data = list.slice(start, end);
+    const nextPage = end < total ? page + 1 : undefined;
+    return c.json({ data, nextPage, total });
+  } catch (e) {
+    console.error('GET /api/shop/redemptions error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/shop/redemptions/export', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.text('', 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const currentTenantId = await resolveTenantId(defaultDb, host);
+    const dbGlobal = await getTursoClientForTenant(0);
+
+    const isAdmin = await isSuperAdminUser(userId);
+
+    // filters
+    const fStatus = (() => { const s = String(c.req.query('status') || '').trim(); return s ? s : null; })();
+    const fProductId = (() => { const v = c.req.query('productId'); if (v == null) return null; const n = Number(v); return Number.isFinite(n) ? n : null; })();
+    const fUid = (() => { const u = String(c.req.query('uid') || '').trim(); return u || null; })();
+
+    function applyFilters(list) {
+      return (list || []).filter(item => {
+        if (fStatus && String(item.status) !== fStatus) return false;
+        if (fProductId != null && Number(item.product_id) !== Number(fProductId)) return false;
+        if (fUid && (!item.user || String(item.user.uid) !== String(fUid))) return false;
+        return true;
+      });
+    }
+
+    // collect tenant ids
+    let tenantIds = [currentTenantId];
+    if (isAdmin) {
+      try {
+        const trs = await dbGlobal.select().from(tenantRequestsTable);
+        tenantIds = [0, ...new Set((trs || []).map(t => Number(t.id)).filter(n => Number.isFinite(n)))];
+      } catch {}
+    }
+
+    // domain map for CSV
+    let idToDomain = new Map();
+    try {
+      const trs = await dbGlobal.select().from(tenantRequestsTable);
+      idToDomain = new Map((trs || []).map(t => [Number(t.id), t.desiredDomain || t.desired_domain || '']));
+      idToDomain.set(0, 'main');
+    } catch {}
+
+    const all = [];
+    for (const tId of tenantIds) {
+      try {
+        const tDb = await getTursoClientForTenant(tId);
+        const rows = await tDb.select().from(shopRedemptions).where(eq(shopRedemptions.tenantId, tId)).orderBy(desc(shopRedemptions.createdAt));
+        for (const r of rows || []) {
+          all.push({
+            id: r.id,
+            tenant_id: r.tenantId,
+            product_id: r.productId,
+            user_id: r.userId,
+            points_spent: r.pointsSpent,
+            status: r.status,
+            notes: r.notes || '',
+            product_name: r.productName || '',
+            product_price: r.productPrice || '',
+            created_at: r.createdAt,
+          });
+        }
+      } catch {}
+    }
+
+    // filters + sort
+    let list = applyFilters(all);
+    list.sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    });
+
+    const statusMap = { pending: '待处理', completed: '已完成', rejected: '已拒绝' };
+
+    const header = ['id','tenant_id','tenant_domain','product_id','product_name','user_id','points_spent','status','status_zh','notes','created_at'];
+    const rowsCsv = [header.join(',')];
+    for (const r of list) {
+      const dom = idToDomain.get(Number(r.tenant_id)) || (Number(r.tenant_id) === 0 ? 'main' : '');
+      const statusZh = statusMap[r.status] || r.status || '';
+      const line = [
+        r.id,
+        r.tenant_id,
+        JSON.stringify(dom || ''),
+        r.product_id,
+        JSON.stringify(r.product_name || ''),
+        r.user_id,
+        r.points_spent,
+        JSON.stringify(r.status || ''),
+        JSON.stringify(statusZh || ''),
+        JSON.stringify((r.notes || '').replace(/\n/g, ' ')),
+        JSON.stringify(r.created_at || ''),
+      ].join(',');
+      rowsCsv.push(line);
+    }
+    const csv = rowsCsv.join('\n');
+    c.header('Content-Type', 'text/csv; charset=utf-8');
+    c.header('Content-Disposition', `attachment; filename="redemptions_${Date.now()}.csv"`);
+    return c.text(csv);
+  } catch (e) {
+    console.error('GET /api/shop/redemptions/export error', e);
+    return c.text('', 500);
+  }
+});
+
+app.post('/api/shop/redemptions/:id/status', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const { status, notes, tenantId: bodyTenantId } = await c.req.json();
+    if (!id || !status) return c.json({ error: 'invalid' }, 400);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const currentTenantId = await resolveTenantId(defaultDb, host);
+
+    // choose DB: allow super admin to operate cross-tenant
+    const isAdmin = await isSuperAdminUser(userId);
+    let targetTenantId = (isAdmin && bodyTenantId != null && Number.isFinite(Number(bodyTenantId))) ? Number(bodyTenantId) : currentTenantId;
+    let db = await getTursoClientForTenant(targetTenantId);
+
+    await db.update(shopRedemptions).set({ status, notes: notes || null }).where(eq(shopRedemptions.id, id));
+    let rows = await db.select().from(shopRedemptions).where(eq(shopRedemptions.id, id)).limit(1);
+    let row = rows?.[0] || null;
+
+    // Fallback: if not found and admin, search across all tenants
+    if (isAdmin && !row) {
+      let tenantIds = [0];
+      try {
+        const trs = await defaultDb.select().from(tenantRequestsTable);
+        tenantIds = [0, ...new Set((trs || []).map(t => Number(t.id)).filter(n => Number.isFinite(n)))];
+      } catch {}
+      for (const tId of tenantIds) {
+        try {
+          const tDb = await getTursoClientForTenant(tId);
+          const tRows = await tDb.select().from(shopRedemptions).where(eq(shopRedemptions.id, id)).limit(1);
+          if (tRows && tRows[0]) {
+            await tDb.update(shopRedemptions).set({ status, notes: notes || null }).where(eq(shopRedemptions.id, id));
+            const tRows2 = await tDb.select().from(shopRedemptions).where(eq(shopRedemptions.id, id)).limit(1);
+            row = tRows2?.[0] || tRows[0];
+            targetTenantId = tId;
+            db = tDb;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    // notify user in global notifications
+    try {
+      if (row && row.userId) {
+        const gdb = await getTursoClientForTenant(0);
+        const title = '兑换处理更新';
+        const statusMap = { pending: '待处理', completed: '已完成', rejected: '已拒绝' };
+        const statusZh = statusMap[status] || status;
+        const message = `您兑换的商品${row.productName ? '「' + row.productName + '」' : ''}状态已更新为「${statusZh}」`;
+        const payload = {
+          type: 'shop_redemption_update',
+          title,
+          message,
+          status,
+          notes: notes || null,
+          product_name: row.productName || null,
+          redemption_id: id,
+          tenant_id: targetTenantId,
+          created_at: new Date().toISOString(),
+        };
+        await gdb.insert(notificationsTable).values({ userId: row.userId, content: JSON.stringify(payload), isRead: 0, createdAt: new Date().toISOString() });
+      }
+    } catch {}
+
+    // return normalized row
+    if (row) {
+      return c.json({
+        id: row.id,
+        tenant_id: row.tenantId,
+        product_id: row.productId,
+        user_id: row.userId,
+        points_spent: row.pointsSpent,
+        status: row.status,
+        notes: row.notes || null,
+        product_name: row.productName || null,
+        product_image_url: row.productImageUrl || null,
+        product_price: row.productPrice || null,
+        created_at: row.createdAt,
+      });
+    }
+
+    return c.json({ id, status, notes: notes || null });
+  } catch (e) {
+    console.error('POST /api/shop/redemptions/:id/status error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// ---------- Points: Check-in & Invite reward ----------
+app.post('/api/points/checkin', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+
+    // Shanghai timezone date compare
+    const fmtDate = (d) => new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+    const todayStr = fmtDate(new Date());
+
+    const history = await db.select().from(pointsHistoryTable).where(eq(pointsHistoryTable.userId, userId));
+    const doneToday = (history || []).some(h => {
+      try { return fmtDate(new Date(h.createdAt)) === todayStr && h.reason === '每日签到'; } catch { return false; }
+    });
+    if (doneToday) return c.json({ ok: false, reason: 'already-done' });
+
+    const map = await readSettingsMap();
+    const reward = toInt(map['daily_login_reward'], 10);
+    const prof = (await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+    if (!prof) {
+      // auto-create tenant profile if missing
+      await db.insert(profiles).values({ id: userId, username: '用户', tenantId, points: reward, createdAt: new Date().toISOString() });
+    } else {
+      await db.update(profiles).set({ points: (prof?.points || 0) + reward }).where(eq(profiles.id, userId));
+    }
+    await db.insert(pointsHistoryTable).values({ userId, changeAmount: reward, reason: '每日签到', createdAt: new Date().toISOString() });
+    return c.json({ ok: true, reward });
+  } catch (e) {
+    console.error('POST /api/points/checkin error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.post('/api/points/reward/invite', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const { inviteeId } = await c.req.json();
+    if (!inviteeId) return c.json({ error: 'invalid' }, 400);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const now = new Date().toISOString();
+    // idempotent: only reward once per (inviter, invitee)
+    const exists = await db.select().from(invitations).where(and(eq(invitations.inviteeId, inviteeId), eq(invitations.inviterId, userId))).limit(1);
+    if (exists && exists.length > 0) return c.json({ ok: false, reason: 'duplicate' });
+    const map = await readSettingsMap();
+    const reward = toInt(map['invite_reward_points'], 50);
+    await db.insert(invitations).values({ tenantId, inviteeId, inviterId: userId, createdAt: now });
+    // also record in global database for unified analytics
+    try {
+      const g = await getTursoClientForTenant(0);
+      const existsG = await g.select().from(invitations).where(and(eq(invitations.inviteeId, inviteeId), eq(invitations.inviterId, userId))).limit(1);
+      if (!existsG || existsG.length === 0) {
+        await g.insert(invitations).values({ tenantId, inviteeId, inviterId: userId, createdAt: now });
+      }
+    } catch {}
+    const prof = (await db.select().from(profiles).where(eq(profiles.id, userId)).limit(1))?.[0];
+    await db.update(profiles).set({ points: (prof?.points || 0) + reward, invitationPoints: (prof?.invitationPoints || 0) + reward }).where(eq(profiles.id, userId));
+    await db.insert(pointsHistoryTable).values({ userId, changeAmount: reward, reason: '邀请好友奖励', createdAt: now });
+    return c.json({ ok: true, reward });
+  } catch (e) {
+    console.error('POST /api/points/reward/invite error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// ---------- Admin: App Settings ----------
+const defaultSettingsDefs = [
+  { key: 'new_user_points', value: '100', name: '新用户初始积分', description: '新注册用户默认获得的积分数量', type: 'number' },
+  { key: 'initial_virtual_currency', value: '0', name: '新用户初始虚拟分', description: '新注册用户默认获得的虚拟分数量', type: 'number' },
+  { key: 'new_user_free_posts', value: '0', name: '新用户免费发布次数', description: '新注册用户可免费发布的次数', type: 'number' },
+  { key: 'invite_reward_points', value: '50', name: '邀请奖励积分', description: '成功邀请一个新用户的奖励积分', type: 'number' },
+  { key: 'social_post_cost', value: '100', name: '普通动态发布消耗', description: '发布一条普通动态消耗的积分', type: 'number' },
+  { key: 'comment_cost', value: '1', name: '评论消耗', description: '发表评论消耗的积分', type: 'number' },
+  { key: 'ad_post_cost', value: '200', name: '广告动态发布消耗', description: '发布一条广告动态消耗的积分', type: 'number' },
+  { key: 'daily_login_reward', value: '10', name: '每日签到奖励', description: '每日签到获得的积分数量', type: 'number' },
+  { key: 'social_forum_mode', value: 'shared', name: '朋友圈模式', description: 'shared=共享；isolated=独享（每个分站自有帖子）', type: 'text' },
+  { key: 'embed_obfuscate_enabled', value: 'false', name: '嵌入内容混淆开关', description: '仅主站：开启后，提供给外站的 iframe 内容将被加密/混淆并在前端解码', type: 'boolean' },
+  { key: 'embed_obfuscate_key', value: 'YjM2M2JkYjItZGVmYy00NzYyLWEyY2QtY2FjY2FjY2FjY2FjY2FjY2E=', name: '嵌入内容混淆密钥', description: '仅主站：用于对外 iframe 内容的对称加密密钥（建议 32 字节）', type: 'text' },
+];
+
+async function ensureDefaultSettings(db, tenantId = 0) {
+  try {
+    // create table if not exists (best-effort)
+    const raw = getGlobalClient();
+    try { await raw.execute("create table if not exists app_settings (tenant_id integer not null, key text not null, value text, name text, description text, type text, primary key (tenant_id, key))"); } catch {}
+  } catch {}
+  for (const def of defaultSettingsDefs) {
+    try {
+      const exists = await db.select().from(appSettings).where(and(eq(appSettings.tenantId, tenantId), eq(appSettings.key, def.key))).limit(1);
+      if (!exists || exists.length === 0) {
+        await db.insert(appSettings).values({ tenantId, key: def.key, value: def.value, name: def.name, description: def.description, type: def.type });
+      } else {
+        const row = exists[0];
+        // backfill metadata/value if missing
+        const set = {};
+        if (!row.name) set.name = def.name;
+        if (!row.description) set.description = def.description;
+        if (!row.type) set.type = def.type;
+        if (row.value == null || row.value === '') set.value = def.value;
+        if (Object.keys(set).length > 0) {
+          await db.update(appSettings).set(set).where(and(eq(appSettings.tenantId, tenantId), eq(appSettings.key, def.key)));
+        }
+      }
+    } catch {}
+  }
+}
+
+app.get('/api/admin/settings', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json([], 403);
+    const db = await getTursoClientForTenant(0);
+    await ensureDefaultSettings(db, 0);
+    const rows = await db.select().from(appSettings).where(eq(appSettings.tenantId, 0));
+    return c.json(rows || []);
+  } catch (e) {
+    console.error('GET /api/admin/settings error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/admin/settings', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const updates = await c.req.json();
+    if (!Array.isArray(updates)) return c.json({ error: 'invalid' }, 400);
+    const db = await getTursoClientForTenant(0);
+    for (const u of updates) {
+      const rec = {
+        tenantId: 0,
+        key: String(u.key),
+        value: u.value != null ? String(u.value) : null,
+        name: u.name || null,
+        description: u.description || null,
+        type: u.type || null,
+      };
+      // upsert by (tenant_id, key)
+      const exists = await db.select().from(appSettings).where(and(eq(appSettings.tenantId, 0), eq(appSettings.key, rec.key))).limit(1);
+      if (exists && exists.length > 0) {
+        await db.update(appSettings).set(rec).where(and(eq(appSettings.tenantId, 0), eq(appSettings.key, rec.key)));
+      } else {
+        await db.insert(appSettings).values(rec);
+      }
+    }
+    const rows = await db.select().from(appSettings).where(eq(appSettings.tenantId, 0));
+    return c.json({ ok: true, settings: rows || [] });
+  } catch (e) {
+    console.error('POST /api/admin/settings error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// Helpers: settings
+const __settingsCache = { data: null, ts: 0 };
+async function readSettingsMap() {
+  const now = Date.now();
+  if (__settingsCache.data && (now - __settingsCache.ts) < 30000) {
+    return __settingsCache.data;
+  }
+  const db = await getTursoClientForTenant(0);
+  const rows = await db.select().from(appSettings).where(inArray(appSettings.tenantId, [0]));
+  const map = {};
+  for (const r of rows || []) map[r.key] = r.value;
+  __settingsCache.data = map;
+  __settingsCache.ts = now;
+  return map;
+}
+
+function toInt(val, def) {
+  const n = Number(val);
+  return Number.isFinite(n) ? n : def;
+}
 
 const port = process.env.PORT ? Number(process.env.PORT) : 8787;
 if (!process.env.VERCEL) {
@@ -170,5 +3360,542 @@ serve({ fetch: app.fetch, port });
 console.log(`BFF running on http://localhost:${port}`); 
 }
 
-export default app;
-export { app }; 
+export default app.fetch; 
+
+// Author can edit a tenant post once
+app.put('/api/posts/:id', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    const db = await getTursoClientForTenant(tenantId);
+    const id = Number(c.req.param('id'));
+    const { content, images } = await c.req.json();
+    const rows = await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1);
+    const post = rows?.[0];
+    if (!post) return c.json({ error: 'not-found' }, 404);
+    if (post.authorId !== userId) return c.json({ error: 'forbidden' }, 403);
+    if (post.updatedAt && post.updatedAt !== post.createdAt) return c.json({ error: 'already-edited' }, 400);
+    const now = new Date().toISOString();
+    const newImages = Array.isArray(images) ? JSON.stringify(images) : (typeof post.images === 'string' ? post.images : JSON.stringify([]));
+    await db.update(postsTable).set({ content: String(content || post.content), images: newImages, updatedAt: now }).where(eq(postsTable.id, id));
+    const updated = (await db.select().from(postsTable).where(eq(postsTable.id, id)).limit(1))?.[0];
+    return c.json(updated || { id, content, images: newImages, updated_at: now });
+  } catch (e) {
+    console.error('PUT /api/posts/:id error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+// Author can edit a shared post once
+app.put('/api/shared/posts/:id', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = getGlobalDb();
+    const id = Number(c.req.param('id'));
+    const { content, images } = await c.req.json();
+    const rows = await db.select().from(sharedPosts).where(eq(sharedPosts.id, id)).limit(1);
+    const post = rows?.[0];
+    if (!post) return c.json({ error: 'not-found' }, 404);
+    if (post.authorId !== userId) return c.json({ error: 'forbidden' }, 403);
+    if (post.updatedAt && post.updatedAt !== post.createdAt) return c.json({ error: 'already-edited' }, 400);
+    const now = new Date().toISOString();
+    const newImages = Array.isArray(images) ? JSON.stringify(images) : (typeof post.images === 'string' ? post.images : JSON.stringify([]));
+    await db.update(sharedPosts).set({ content: String(content || post.content), images: newImages, updatedAt: now }).where(eq(sharedPosts.id, id));
+    const updated = (await db.select().from(sharedPosts).where(eq(sharedPosts.id, id)).limit(1))?.[0];
+    return c.json(updated || { id, content, images: newImages, updated_at: now });
+  } catch (e) {
+    console.error('PUT /api/shared/posts/:id error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.get('/api/admin/tenants', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const gdb = getGlobalDb();
+    await ensureTenantRequestsSchemaRaw(getGlobalClient());
+    const status = c.req.query('status');
+    const rows = await gdb.select().from(tenantRequestsTable);
+    const list = (rows || [])
+      .filter(r => {
+        const s = String(r.status || '');
+        if (!status) return s === 'approved' || s === 'active';
+        if (status === 'approved') return s === 'approved' || s === 'active';
+        return s === status;
+      })
+      .map(r => ({ id: r.id, desired_domain: r.desiredDomain, status: r.status }));
+    return c.json(list);
+  } catch (e) {
+    console.error('GET /api/admin/tenants error', e);
+    return c.json([]);
+  }
+});
+
+app.post('/api/admin/notifications/send', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json({ error: 'forbidden' }, 403);
+    const body = await c.req.json();
+    const content = String(body?.content || '').trim();
+    const target = String(body?.target || 'all');
+    const targetUid = body?.uid != null ? String(body.uid) : null;
+    if (!content) return c.json({ error: 'invalid' }, 400);
+
+    const db = await getTursoClientForTenant(0);
+
+    if (target === 'all') {
+      const users = await db.select({ id: profiles.id }).from(profiles);
+      const now = new Date().toISOString();
+      for (const u of users || []) {
+        await db.insert(notificationsTable).values({ userId: u.id, content, isRead: 0, createdAt: now });
+      }
+      return c.json({ ok: true, count: (users || []).length });
+    }
+
+    if (target === 'user') {
+      if (!targetUid || !/^\d{6,8}$/.test(targetUid)) return c.json({ error: 'invalid-uid' }, 400);
+      const rows = await db.select().from(profiles).where(eq(profiles.uid, targetUid)).limit(1);
+      const u = rows?.[0];
+      if (!u) return c.json({ error: 'user-not-found' }, 404);
+      await db.insert(notificationsTable).values({ userId: u.id, content, isRead: 0, createdAt: new Date().toISOString() });
+      return c.json({ ok: true, userId: u.id });
+    }
+
+    return c.json({ error: 'invalid-target' }, 400);
+  } catch (e) {
+    console.error('POST /api/admin/notifications/send error', e);
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.get('/api/notifications', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ data: [], nextPage: undefined }, 401);
+    const page = Number(c.req.query('page') || 0);
+    const size = Math.min(Number(c.req.query('size') || 20), 100);
+    const db = await getTursoClientForTenant(0);
+    const rows = await db
+      .select()
+      .from(notificationsTable)
+      .where(eq(notificationsTable.userId, userId))
+      .orderBy(desc(notificationsTable.createdAt))
+      .limit(size)
+      .offset(page * size);
+    const list = (rows || []).map(r => {
+      let parsed;
+      try { parsed = typeof r.content === 'string' ? JSON.parse(r.content) : (r.content || {}); } catch { parsed = { message: String(r.content || '') }; }
+      const typeVal = r.type || (parsed && parsed.type) || 'system';
+      const replaceStatus = (text) => {
+        if (!text || typeof text !== 'string') return text;
+        return text
+          .replace(/\bpending\b/gi, '待处理')
+          .replace(/\bcompleted\b/gi, '已完成')
+          .replace(/\brejected\b/gi, '已拒绝');
+      };
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.message) parsed.message = replaceStatus(parsed.message);
+        if (parsed.status) {
+          const map = { pending: '待处理', completed: '已完成', rejected: '已拒绝' };
+          parsed.status_zh = map[parsed.status] || parsed.status;
+        }
+      }
+      return {
+      id: r.id,
+      user_id: r.userId,
+      is_read: r.isRead ? 1 : 0,
+      created_at: r.createdAt,
+        type: typeVal,
+      related_post_id: r.relatedPostId || null,
+        content: parsed,
+      };
+    });
+    return c.json({ data: list, nextPage: list.length === size ? page + 1 : undefined });
+  } catch (e) {
+    console.error('GET /api/notifications error', e);
+    return c.json({ data: [], nextPage: undefined });
+  }
+});
+
+app.post('/api/notifications/mark-read-all', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const db = await getTursoClientForTenant(0);
+    await db.update(notificationsTable).set({ isRead: 1 }).where(and(eq(notificationsTable.userId, userId), eq(notificationsTable.isRead, 0)));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/notifications/mark-read-all error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/notifications/:id/mark-read', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    const db = await getTursoClientForTenant(0);
+    await db.update(notificationsTable).set({ isRead: 1 }).where(and(eq(notificationsTable.id, id), eq(notificationsTable.userId, userId)));
+    return c.json({ ok: true });
+  } catch (e) {
+    console.error('POST /api/notifications/:id/mark-read error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/admin/invitations/stats', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const isAdmin = await isSuperAdminUser(userId);
+    if (!isAdmin) return c.json([], 403);
+    const uidFilter = c.req.query('uid');
+    const db = await getTursoClientForTenant(0);
+
+    // load all invitations
+    const invs = await db.select().from(invitations);
+    // load all profiles for mapping
+    const profs = await db.select().from(profiles);
+    const idToProfile = new Map((profs || []).map(p => [p.id, p]));
+
+    // build inviter -> invited array
+    const map = new Map();
+    for (const inv of invs || []) {
+      const inviter = idToProfile.get(inv.inviterId);
+      const invitee = idToProfile.get(inv.inviteeId);
+      if (!inviter || !invitee) continue;
+      if (uidFilter && String(inviter.uid) !== String(uidFilter) && String(invitee.uid) !== String(uidFilter)) continue;
+      const arr = map.get(inv.inviterId) || [];
+      arr.push(invitee);
+      map.set(inv.inviterId, arr);
+    }
+
+    // build stats rows
+    const rows = [];
+    for (const [inviterId, invitees] of map.entries()) {
+      const inviter = idToProfile.get(inviterId);
+      rows.push({
+        inviter_id: inviterId,
+        inviter_uid: inviter?.uid || null,
+        inviter_username: inviter?.username || null,
+        invited_users_count: invitees.length,
+        invited_users: invitees.map(p => ({ uid: p.uid, username: p.username }))
+      });
+    }
+
+    // sort by invited count desc
+    rows.sort((a, b) => (b.invited_users_count || 0) - (a.invited_users_count || 0));
+    return c.json(rows);
+  } catch (e) {
+    console.error('GET /api/admin/invitations/stats error', e);
+    return c.json([]);
+  }
+});
+
+app.get('/api/invite/:code', async (c) => {
+  try {
+    const code = c.req.param('code');
+    if (!code) return c.json({ ok: false }, 400);
+    const db = await getTursoClientForTenant(0);
+    // ensure invite_code column exists
+    try { const raw = getGlobalClient(); await raw.execute("alter table profiles add column invite_code text"); } catch {}
+    const rows = await db.select().from(profiles).where(eq(profiles.inviteCode, code)).limit(1);
+    const inviter = rows?.[0];
+    if (!inviter) return c.json({ ok: false, error: 'invalid-code' }, 404);
+    // set cookie for later reward
+    c.header('Set-Cookie', `inviter_id=${inviter.id}; Path=/; Max-Age=${7*24*3600}; SameSite=Lax`);
+    return c.json({ ok: true, inviter_id: inviter.id });
+  } catch (e) {
+    return c.json({ ok: false }, 500);
+  }
+});
+
+// Ensure global shared forum tables
+const __ensureCache = { shared: false, tenant: new Set(), profileCols: new Set(), redemptCols: new Set(), pointsHistory: new Set() };
+
+async function ensureSharedForumSchema() {
+  try {
+    if (__ensureCache.shared) return;
+    const client = getGlobalClient();
+    const statements = [
+      "create table if not exists shared_profiles (id text primary key, username text, avatar_url text, created_at text, uid text)",
+      "create table if not exists shared_posts (id integer primary key autoincrement, author_id text not null, content text, images text, is_pinned integer default 0, status text default 'approved', created_at text, updated_at text)",
+      "create table if not exists shared_comments (id integer primary key autoincrement, post_id integer not null, user_id text not null, content text, created_at text)",
+      "create table if not exists shared_likes (post_id integer not null, user_id text not null, primary key (post_id, user_id))",
+      // indexes
+      "create index if not exists idx_shared_posts_pin_created on shared_posts(is_pinned, created_at)",
+      "create index if not exists idx_shared_comments_post_created on shared_comments(post_id, created_at)",
+      "create index if not exists idx_shared_likes_post on shared_likes(post_id)"
+    ];
+    for (const s of statements) { try { await client.execute(s); } catch {} }
+    __ensureCache.shared = true;
+  } catch {}
+}
+
+// Ensure tenant forum tables (for default DB or branch DB)
+async function ensureTenantForumSchemaRaw(tenantId) {
+  try {
+    if (__ensureCache.tenant.has(Number(tenantId))) return;
+    const client = await getLibsqlClientForTenantRaw(tenantId);
+    const statements = [
+      "create table if not exists profiles (id text primary key, username text, avatar_url text, tenant_id integer default 0, points integer default 0, created_at text, uid text, invite_code text, virtual_currency integer default 0, invitation_points integer default 0, free_posts_count integer default 0)",
+      "create table if not exists posts (id integer primary key autoincrement, tenant_id integer not null default 0, author_id text not null, content text, images text, is_ad integer default 0, is_pinned integer default 0, status text default 'approved', rejection_reason text, created_at text, updated_at text)",
+      "create table if not exists comments (id integer primary key autoincrement, post_id integer not null, user_id text not null, content text, created_at text)",
+      "create table if not exists likes (post_id integer not null, user_id text not null, primary key (post_id, user_id))"
+    ];
+    for (const s of statements) { try { await client.execute(s); } catch {} }
+    __ensureCache.tenant.add(Number(tenantId));
+  } catch {}
+}
+
+app.delete('/api/shop/redemptions/:id', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ ok: false, error: 'unauthorized' }, 401);
+    const id = Number(c.req.param('id'));
+    if (!id) return c.json({ ok: false, error: 'invalid' }, 400);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const currentTenantId = await resolveTenantId(defaultDb, host);
+    const isAdmin = await isSuperAdminUser(userId);
+
+    // Try current tenant first (ensure exists)
+    let deleted = false;
+    try {
+      const db = await getTursoClientForTenant(currentTenantId);
+      const exists = await db.select().from(shopRedemptions).where(eq(shopRedemptions.id, id)).limit(1);
+      if (exists && exists[0]) {
+        await db.delete(shopRedemptions).where(eq(shopRedemptions.id, id));
+        deleted = true;
+      }
+    } catch {}
+
+    // If not deleted and admin, search which tenant owns this id, then delete
+    if (!deleted && isAdmin) {
+      try {
+        const gdb = await getTursoClientForTenant(0);
+        const trs = await gdb.select().from(tenantRequestsTable);
+        const tenantIds = [0, ...new Set((trs || []).map(t => Number(t.id)).filter(n => Number.isFinite(n)))];
+        for (const tId of tenantIds) {
+          try {
+            const tDb = await getTursoClientForTenant(tId);
+            const ex = await tDb.select().from(shopRedemptions).where(eq(shopRedemptions.id, id)).limit(1);
+            if (ex && ex[0]) {
+              await tDb.delete(shopRedemptions).where(eq(shopRedemptions.id, id));
+              deleted = true;
+              break;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    return c.json({ ok: deleted });
+  } catch (e) {
+    console.error('DELETE /api/shop/redemptions/:id error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.post('/api/shop/redemptions/batch-action', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ ok: false, error: 'unauthorized' }, 401);
+    const body = await c.req.json();
+    const ids = Array.isArray(body?.ids) ? body.ids.map(n => Number(n)).filter(n => Number.isFinite(n)) : [];
+    const action = String(body?.action || '').toLowerCase();
+    const status = body?.status ? String(body.status) : null;
+    const notes = body?.notes ? String(body.notes) : null;
+    if (ids.length === 0) return c.json({ ok: false, error: 'empty-ids' }, 400);
+
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const currentTenantId = await resolveTenantId(defaultDb, host);
+    const isAdmin = await isSuperAdminUser(userId);
+
+    // collect candidate tenant ids
+    let tenantIds = [currentTenantId];
+    if (isAdmin) {
+      try {
+        const gdb = await getTursoClientForTenant(0);
+        const trs = await gdb.select().from(tenantRequestsTable);
+        tenantIds = [0, ...new Set((trs || []).map(t => Number(t.id)).filter(n => Number.isFinite(n)))];
+      } catch {}
+    }
+
+    let affected = 0;
+    for (const tId of tenantIds) {
+      try {
+        const db = await getTursoClientForTenant(tId);
+        // filter ids existing in this tenant
+        const existing = await db.select().from(shopRedemptions).where(inArray(shopRedemptions.id, ids));
+        if (!existing || existing.length === 0) continue;
+        const idSet = new Set(existing.map(r => r.id));
+        const idsInTenant = ids.filter(x => idSet.has(x));
+        if (idsInTenant.length === 0) continue;
+
+        if (action === 'delete') {
+          for (const rid of idsInTenant) {
+            await db.delete(shopRedemptions).where(eq(shopRedemptions.id, rid));
+            affected++;
+          }
+        } else if (action === 'status' && status) {
+          for (const rid of idsInTenant) {
+            await db.update(shopRedemptions).set({ status, notes: notes || null }).where(eq(shopRedemptions.id, rid));
+            affected++;
+          }
+        }
+      } catch {}
+    }
+
+    return c.json({ ok: true, affected });
+  } catch (e) {
+    console.error('POST /api/shop/redemptions/batch-action error', e);
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/tenant/settings', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json([], 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const tenantIdParam = Number(c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+    const allowed = await canManageTenant(userId, tenantId);
+    if (!allowed) return c.json([], 403);
+    const db = await getTursoClientForTenant(tenantId);
+    try { const raw = await getLibsqlClientForTenantRaw(tenantId); await raw.execute("create table if not exists app_settings (tenant_id integer not null, key text not null, value text, name text, description text, type text, primary key (tenant_id, key))"); } catch {}
+    const rows = await db.select().from(appSettings).where(eq(appSettings.tenantId, tenantId));
+    return c.json(rows || []);
+  } catch (e) {
+    return c.json([]);
+  }
+});
+
+app.post('/api/tenant/settings', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const body = await c.req.json();
+    const tenantIdParam = Number(body?.tenantId || c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+    const allowed = await canManageTenant(userId, tenantId);
+    if (!allowed) return c.json({ error: 'forbidden' }, 403);
+    const updates = Array.isArray(body?.updates) ? body.updates : body;
+    if (!Array.isArray(updates)) return c.json({ error: 'invalid' }, 400);
+    const db = await getTursoClientForTenant(tenantId);
+    for (const u of updates) {
+      const rec = {
+        tenantId,
+        key: String(u.key),
+        value: u.value != null ? String(u.value) : null,
+        name: u.name || null,
+        description: u.description || null,
+        type: u.type || null,
+      };
+      const exists = await db.select().from(appSettings).where(and(eq(appSettings.tenantId, tenantId), eq(appSettings.key, rec.key))).limit(1);
+      if (exists && exists.length > 0) {
+        await db.update(appSettings).set(rec).where(and(eq(appSettings.tenantId, tenantId), eq(appSettings.key, rec.key)));
+      } else {
+        await db.insert(appSettings).values(rec);
+      }
+    }
+    const rows = await db.select().from(appSettings).where(eq(appSettings.tenantId, tenantId));
+    return c.json({ ok: true, settings: rows || [] });
+  } catch (e) {
+    return c.json({ error: 'failed' }, 500);
+  }
+});
+
+app.delete('/api/tenant/settings', async (c) => {
+  try {
+    const userId = c.get('userId'); if (!userId) return c.json({ ok: false, error: 'unauthorized' }, 401);
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = c.get('host').split(':')[0];
+    const resolvedTenantId = await resolveTenantId(defaultDb, host);
+    const tenantIdParam = Number(c.req.query('tenantId') || NaN);
+    const tenantId = Number.isFinite(tenantIdParam) ? tenantIdParam : resolvedTenantId;
+    const key = String(c.req.query('key') || '');
+    if (!key) return c.json({ ok: false, error: 'invalid-key' }, 400);
+    const allowed = await canManageTenant(userId, tenantId);
+    if (!allowed) return c.json({ ok: false, error: 'forbidden' }, 403);
+    const db = await getTursoClientForTenant(tenantId);
+    await db.delete(appSettings).where(and(eq(appSettings.tenantId, tenantId), eq(appSettings.key, key)));
+    return c.json({ ok: true });
+  } catch (e) {
+    return c.json({ ok: false }, 500);
+  }
+});
+
+app.get('/api/embed/cipher', async (c) => {
+  try {
+    const widget = String(c.req.query('widget') || '').trim();
+    if (!widget) return c.json({ error: 'missing-widget' }, 400);
+
+    // main settings (tenant 0)
+    const defaultDb = await getTursoClientForTenant(0);
+    const settingsRows = await defaultDb.select().from(appSettings).where(eq(appSettings.tenantId, 0));
+    const settings = {};
+    for (const r of settingsRows || []) settings[r.key] = r.value;
+    const enabled = String(settings['embed_obfuscate_enabled'] || 'false').toLowerCase() === 'true';
+    const keyStr = settings['embed_obfuscate_key'] || '';
+
+    // map widget -> { page, section }
+    const widgetMap = {
+      'social_pinned_ads': { page: 'social', section: 'pinned_ads' },
+      'my_page_pg_live_stream': { page: 'my_page', section: 'pg_live_stream' },
+    };
+    const target = widgetMap[widget];
+    if (!target) return c.json({ error: 'unknown-widget' }, 400);
+
+    // load MAIN tenant(0) content
+    const rows = await defaultDb
+      .select()
+      .from(pageContentTable)
+      .where(and(eq(pageContentTable.page, target.page), eq(pageContentTable.section, target.section), eq(pageContentTable.tenantId, 0)))
+      .orderBy(pageContentTable.position);
+
+    const list = (rows || []).map((r) => {
+      let obj = (typeof r.content === 'string') ? (() => { try { return JSON.parse(r.content); } catch { return {}; } })() : (r.content || {});
+      const title = obj.title || obj.details_title || '';
+      const description = obj.description || obj.details_content || '';
+      const link_url = obj.link_url || obj.link || '';
+      const image_url = obj.image_url || obj.background_image_url || obj.imageUrl || '';
+      return { title, description, link_url, image_url };
+    });
+
+    if (!enabled || !keyStr) {
+      return c.json({ encrypted: false, data: list });
+    }
+
+    // AES-256-GCM encrypt using SHA-256(keyStr) as key
+    const iv = crypto.randomBytes(12);
+    const key = crypto.createHash('sha256').update(keyStr, 'utf8').digest(); // 32 bytes
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const plaintext = Buffer.from(JSON.stringify(list), 'utf8');
+    const enc1 = cipher.update(plaintext);
+    const enc2 = cipher.final();
+    const tag = cipher.getAuthTag();
+    const ciphertext = Buffer.concat([enc1, enc2, tag]);
+
+    const b64 = (buf) => buf.toString('base64');
+    return c.json({ encrypted: true, iv: b64(iv), ciphertext: b64(ciphertext) });
+  } catch (e) {
+    console.error('GET /api/embed/cipher error', e);
+    return c.json({ error: 'internal' }, 500);
+  }
+});
+
+app.get('/api/tenant/resolve', async (c) => {
+  try {
+    const defaultDb = await getTursoClientForTenant(0);
+    const host = (c.get('host') || c.req.header('host') || '').split(':')[0];
+    const tenantId = await resolveTenantId(defaultDb, host);
+    return c.json({ tenantId });
+  } catch (e) {
+    return c.json({ tenantId: 0 });
+  }
+});

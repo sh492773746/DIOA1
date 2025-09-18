@@ -8,6 +8,7 @@ const PostImageGrid = ({ images, postId, onImageClick }) => (
         <motion.img
           src={imageUrl} alt={`Post image ${index + 1}`}
           className="w-full h-full object-cover rounded-lg cursor-pointer transition-all duration-300 hover:scale-105"
+          loading="lazy" decoding="async"
           layoutId={`post-image-${postId}-${index}`}
         />
       </div>

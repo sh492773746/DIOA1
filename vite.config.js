@@ -4,6 +4,7 @@ import { createLogger, defineConfig } from 'vite';
 import inlineEditPlugin from './plugins/visual-editor/vite-plugin-react-inline-editor.js';
 import editModeDevPlugin from './plugins/visual-editor/vite-plugin-edit-mode.js';
 
+
 const isDev = process.env.NODE_ENV !== 'production';
 
 const configHorizonsViteErrorHandler = `
@@ -109,6 +110,20 @@ window.fetch = function(...args) {
 		return originalFetch.apply(this, args);
 	}
 
+	const shouldSuppress = (u) => {
+		try {
+			const p = new URL(u, location.origin);
+			const pathname = p.pathname || '';
+			return pathname === '/'
+				|| pathname.startsWith('/@vite')
+				|| pathname.startsWith('/@react-refresh')
+				|| pathname.includes('__vite')
+				|| pathname.includes('/vite')
+				|| pathname.includes('sockjs')
+				|| pathname.includes('client');
+		} catch { return false; }
+	};
+
 	return originalFetch.apply(this, args)
 		.then(async response => {
 			const contentType = response.headers.get('Content-Type') || '';
@@ -118,17 +133,17 @@ window.fetch = function(...args) {
 				contentType.includes('text/html') ||
 				contentType.includes('application/xhtml+xml');
 
-			if (!response.ok && !isDocumentResponse) {
+			if (!response.ok && !isDocumentResponse && !shouldSuppress(url)) {
 					const responseClone = response.clone();
 					const errorFromRes = await responseClone.text();
 					const requestUrl = response.url;
-					console.error(\`Fetch error from \${requestUrl}: \${errorFromRes}\`);
+					console.error('Fetch error from ' + requestUrl + ': ' + errorFromRes);
 			}
 
 			return response;
 		})
 		.catch(error => {
-			if (!url.match(/\.html?$/i)) {
+			if (!url.match(/\.html?$/i) && !shouldSuppress(url)) {
 				console.error(error);
 			}
 
@@ -140,32 +155,16 @@ window.fetch = function(...args) {
 const addTransformIndexHtml = {
 	name: 'add-transform-index-html',
 	transformIndexHtml(html) {
-		const tags = [
-			{
-				tag: 'script',
-				attrs: { type: 'module' },
-				children: configHorizonsRuntimeErrorHandler,
-				injectTo: 'head',
-			},
-			{
-				tag: 'script',
-				attrs: { type: 'module' },
-				children: configHorizonsViteErrorHandler,
-				injectTo: 'head',
-			},
-			{
-				tag: 'script',
-				attrs: {type: 'module'},
-				children: configHorizonsConsoleErrroHandler,
-				injectTo: 'head',
-			},
-			{
-				tag: 'script',
-				attrs: { type: 'module' },
-				children: configWindowFetchMonkeyPatch,
-				injectTo: 'head',
-			},
-		];
+		const tags = [];
+
+		if (isDev) {
+			tags.push(
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsRuntimeErrorHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsViteErrorHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configHorizonsConsoleErrroHandler, injectTo: 'head' },
+				{ tag: 'script', attrs: { type: 'module' }, children: configWindowFetchMonkeyPatch, injectTo: 'head' },
+			);
+		}
 
 		if (!isDev && process.env.TEMPLATE_BANNER_SCRIPT_URL && process.env.TEMPLATE_REDIRECT_URL) {
 			tags.push(
@@ -205,7 +204,7 @@ export default defineConfig({
 	plugins: [
 		...(isDev ? [inlineEditPlugin(), editModeDevPlugin()] : []),
 		react(),
-		addTransformIndexHtml
+		addTransformIndexHtml,
 	],
 	server: {
 		cors: true,
@@ -213,6 +212,22 @@ export default defineConfig({
 			'Cross-Origin-Embedder-Policy': 'credentialless',
 		},
 		allowedHosts: true,
+		proxy: {
+			'/api': {
+				target: 'http://localhost:8787',
+				changeOrigin: true,
+				configure: (proxy /*: import('http-proxy').Server */) => {
+					proxy.on('proxyReq', (proxyReq, req) => {
+						try {
+							const originalHost = req?.headers?.host;
+							if (originalHost) {
+								proxyReq.setHeader('x-forwarded-host', originalHost);
+							}
+						} catch {}
+					});
+				},
+			},
+		},
 	},
 	resolve: {
 		extensions: ['.jsx', '.js', '.tsx', '.ts', '.json', ],
@@ -227,7 +242,23 @@ export default defineConfig({
 				'@babel/traverse',
 				'@babel/generator',
 				'@babel/types'
-			]
-		}
+			],
+			output: {},
+		},
+	},
+	define: {
+		'import.meta.env.NEXT_PUBLIC_ROOT_DOMAIN': JSON.stringify(process.env.NEXT_PUBLIC_ROOT_DOMAIN),
+		'import.meta.env.NEXT_PUBLIC_SUPABASE_URL': JSON.stringify(process.env.NEXT_PUBLIC_SUPABASE_URL),
+		'import.meta.env.NEXT_PUBLIC_SUPABASE_ANON_KEY': JSON.stringify(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY),
+		'import.meta.env.SUPABASE_SERVICE_ROLE_KEY': JSON.stringify(process.env.SUPABASE_SERVICE_ROLE_KEY),
+		'import.meta.env.DATABASE_URL': JSON.stringify(process.env.DATABASE_URL),
+		'import.meta.env.TURSO_DATABASE_URL': JSON.stringify(process.env.TURSO_DATABASE_URL),
+		'import.meta.env.TURSO_PRIMARY_URL': JSON.stringify(process.env.TURSO_PRIMARY_URL),
+		'import.meta.env.TURSO_NEAREST_URL': JSON.stringify(process.env.TURSO_NEAREST_URL),
+		'import.meta.env.TURSO_AUTH_TOKEN': JSON.stringify(process.env.TURSO_AUTH_TOKEN),
+		'import.meta.env.TURSO_DB_NAME': JSON.stringify(process.env.TURSO_DB_NAME),
+		'import.meta.env.TURSO_API_TOKEN': JSON.stringify(process.env.TURSO_API_TOKEN),
+		'import.meta.env.TURSO_TENANT_REGION': JSON.stringify(process.env.TURSO_TENANT_REGION),
+		'import.meta.env.TURSO_ORG': JSON.stringify(process.env.TURSO_ORG),
 	}
 });

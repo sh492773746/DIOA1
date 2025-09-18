@@ -81,7 +81,8 @@ const InteractiveCarousel = ({ tenantId }) => {
             <img 
               alt={currentSlide?.title}
               className="w-full h-full object-cover"
-              src={currentSlide?.image_url} />
+              src={currentSlide?.image_url}
+              loading="lazy" decoding="async" />
           </motion.div>
         </AnimatePresence>
       </div>

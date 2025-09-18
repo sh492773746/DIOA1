@@ -14,7 +14,7 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 1000 * 60 * 5, // 5 minutes
-      refetchOnWindowFocus: true,
+      refetchOnWindowFocus: false,
       retry: (failureCount, error) => {
         if (error.message.includes('Failed to fetch') || (error instanceof TypeError && error.message === 'Failed to fetch')) {
           return failureCount < 2;
